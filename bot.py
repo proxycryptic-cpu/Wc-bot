@@ -1,124 +1,111 @@
-"""
-⚽ WC Memecoin Bot v2
-- Scans every 30s for new World Cup tokens
-- Prioritises Solana (650x more volume than other chains)
-- Checks DEX Paid, liquidity lock, holder concentration,
-  socials, honeypot signals, age, volume, and more
-- Sends rich Telegram alerts instantly
-"""
-
 import os
 import time
 import requests
 import logging
+import threading
 from datetime import datetime, timezone
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL    = 30          # seconds — fast enough to catch early launches
-PRICE_ALERT_PCT  = 20          # % move in 1h to trigger a price alert
-MIN_LIQUIDITY    = 1000        # ignore tokens below $1k liquidity (pure dust)
 
-# ── World Cup 2026 Keywords ──────────────────────────────────────────────────
-# Covers: FIFA terms · all 48 qualified countries · top star players ·
-#         host cities · tournament slang · common ticker patterns
+# ── Default Settings (changed at runtime via commands) ────────────────────────
+settings = {
+    "interval":    30,      # scan every N seconds
+    "threshold":   20,      # % move to trigger price alert
+    "min_liq":     1000,    # minimum liquidity in USD
+    "max_age":     None,    # max token age in minutes (None = no limit)
+    "chains":      ["solana", "bsc", "base", "ethereum"],
+    "safe_only":   False,   # only show EARLY GEM rated tokens
+    "new_only":    False,   # only show brand new token discoveries
+    "paused":      False,   # pause scanning
+    "charts":      True,    # include chart image in alerts
+}
+
+# ── World Cup 2026 Keywords ───────────────────────────────────────────────────
 WC_KEYWORDS = [
-    # ── Tournament / FIFA terms
     "worldcup", "world cup", "wc2026", "worldcup2026", "fifa2026",
     "fifa", "fwc", "fwc26", "fifawc", "fifameme", "fifacoin",
     "footballcoin", "soccercoin", "goatcoin", "championsleague",
     "goldenboot", "hatrick", "penalty", "freekick", "worldgoal",
-
-    # ── Host nations & cities
     "usmnt", "uswnt", "usasoccer", "mexicofifa", "canadafc",
     "losangeles", "newYork", "miami", "dallas", "boston",
     "seattle", "houston", "philadelphia", "atlanta", "kansascity",
     "sanfrancisco", "guadalajara", "monterrey", "azteca",
     "toronto", "vancouver",
-
-    # ── Europe (16 teams)
     "england", "threelions", "france", "lecoqgaulois",
     "germany", "mannschaft", "spain", "lafuria",
     "portugal", "selecao", "netherlands", "oranje",
     "croatia", "vatreni", "belgium", "rediablos",
     "switzerland", "nati", "austria", "oefb",
     "scotland", "tartan", "norway", "norge",
-    "sweden", "blågult", "turkey", "turkiye",
-    "czechia", "bohemia", "bosnia", "zmajevi",
-
-    # ── South America (6 teams)
+    "sweden", "turkey", "turkiye", "czechia", "bosnia",
     "argentina", "albiceleste", "brazil", "canarinho",
     "colombia", "cafeteros", "uruguay", "charruas",
     "ecuador", "tricolor", "paraguay", "guarani",
-
-    # ── Africa (5 teams)
-    "morocco", "atlasliOns", "algeria", "fennecs",
-    "egypt", "pharaohs", "ghana", "blackstars",
-    "tunisia", "eaglesofcarthage",
-
-    # ── Asia (6 teams)
-    "japan", "samuraiblue", "southkorea", "taegeukwarriors",
-    "australia", "socceroos", "iran", "teamiraN",
-    "jordan", "nasheama", "uzbekistan", "whitewolves",
-
-    # ── CONCACAF (3 + hosts)
-    "panama", "loscanaleros", "curacao", "haiti",
-
-    # ── Oceania
-    "newzealand", "allwhites",
-
-    # ── Debut nations (extra hype)
-    "capeverde", "uzbekistan",
-
-    # ── Superstar players (biggest memecoin triggers)
+    "morocco", "algeria", "fennecs", "egypt", "pharaohs",
+    "ghana", "blackstars", "tunisia",
+    "japan", "samuraiblue", "southkorea", "australia", "socceroos",
+    "iran", "jordan", "uzbekistan",
+    "panama", "curacao", "haiti", "newzealand", "capeverde",
     "ronaldo", "cr7", "messi", "leo", "mbappe",
     "neymar", "haaland", "vinicius", "bellingham",
     "salah", "modric", "dembele", "pedri", "yamal",
     "osimhen", "lewandowski", "kane", "saka", "rashford",
     "pulisic", "reyna", "weah", "ferran", "gavi",
-
-    # ── Common WC ticker patterns
     "wc", "wcup", "goal", "striker", "keeper",
     "offside", "redcard", "yellowcard", "corner",
     "kickoff", "fulltime", "extratime", "shootout",
 ]
 
-# Chains to scan — Solana first (where 99% of WC meme action is)
-CHAINS = ["solana", "bsc", "base", "ethereum"]
+ALL_CHAINS = ["solana", "bsc", "base", "ethereum"]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# Memory: track seen tokens so we don't double-alert
-seen: dict[str, dict] = {}   # address → {first_seen, last_alert, last_price}
+seen: dict = {}
+watchlist: set = set()
+last_update_id = 0
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
-def send_telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send(chat_id, text, photo_url=None):
+    if not TELEGRAM_TOKEN:
+        print(text)
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        ).raise_for_status()
+        if photo_url and settings["charts"]:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                json={
+                    "chat_id": chat_id,
+                    "photo": photo_url,
+                    "caption": text,
+                    "parse_mode": "HTML",
+                },
+                timeout=15,
+            )
+        else:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            ).raise_for_status()
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        log.error(f"Telegram send error: {e}")
 
 
-# ── DEXScreener helpers ───────────────────────────────────────────────────────
-def dex_search(keyword: str) -> list[dict]:
+def broadcast(text, photo_url=None):
+    send(TELEGRAM_CHAT_ID, text, photo_url)
+
+
+# ── DEXScreener ───────────────────────────────────────────────────────────────
+def dex_search(keyword):
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/search?q={keyword}",
@@ -127,65 +114,62 @@ def dex_search(keyword: str) -> list[dict]:
         r.raise_for_status()
         return r.json().get("pairs", []) or []
     except Exception as e:
-        log.error(f"DEXScreener error [{keyword}]: {e}")
+        log.error(f"DEX search error [{keyword}]: {e}")
         return []
 
 
-def dex_token_detail(chain: str, address: str) -> dict:
-    """Fetch richer per-token data from DEXScreener token endpoint."""
+def dex_by_address(address):
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{address}",
             timeout=10,
         )
         r.raise_for_status()
-        pairs = r.json().get("pairs", [])
-        # Return the pair on the correct chain with most liquidity
-        chain_pairs = [p for p in pairs if p.get("chainId") == chain]
-        if chain_pairs:
-            return max(chain_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+        pairs = r.json().get("pairs", []) or []
+        if pairs:
+            return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
         return {}
     except Exception:
         return {}
 
 
-# ── Safety / Rug Checks ───────────────────────────────────────────────────────
-def safety_check(pair: dict) -> tuple[str, list[str], int]:
-    """
-    Returns (verdict, warnings, score).
-    Score 0-100: higher = safer.
-    Verdict: ✅ EARLY GEM | ⚠️ RISKY | 🚨 LIKELY RUG
-    """
-    flags   = []   # bad signs
-    greens  = []   # good signs
-    danger  = 0    # danger points
-    safety  = 0    # safety points
+def chart_url(pair):
+    token_addr = (pair.get("baseToken") or {}).get("address", "")
+    chain = pair.get("chainId", "")
+    if token_addr and chain:
+        return f"https://dexscreener.com/{chain}/{token_addr}/chart.png"
+    return None
 
-    liq        = (pair.get("liquidity") or {}).get("usd", 0)
-    fdv        = pair.get("fdv") or 0
-    vol_h1     = (pair.get("volume") or {}).get("h1", 0) or 0
-    vol_h24    = (pair.get("volume") or {}).get("h24", 0) or 0
-    ch_h1      = (pair.get("priceChange") or {}).get("h1", 0) or 0
-    ch_h6      = (pair.get("priceChange") or {}).get("h6", 0) or 0
-    ch_h24     = (pair.get("priceChange") or {}).get("h24", 0) or 0
-    created_ms = pair.get("pairCreatedAt") or 0
-    info       = pair.get("info") or {}
-    socials    = info.get("socials") or []
-    websites   = info.get("websites") or []
-    boosts     = pair.get("boosts") or {}
-    dex_paid   = boosts.get("active", 0) or 0   # DEXScreener boost = DEX Paid
 
-    age_min = ((time.time() * 1000) - created_ms) / 60_000 if created_ms else 9999
+# ── Safety Check ──────────────────────────────────────────────────────────────
+def safety_check(pair):
+    flags = []
+    greens = []
+    danger = 0
+    safety = 0
 
-    # 1️⃣ DEX Paid (boosted on DEXScreener)
-    if dex_paid and dex_paid > 0:
-        greens.append(f"✅ DEX Paid / Boosted ({dex_paid} active boosts)")
+    liq      = (pair.get("liquidity") or {}).get("usd", 0)
+    fdv      = pair.get("fdv") or 0
+    vol_h1   = (pair.get("volume") or {}).get("h1", 0) or 0
+    ch_h1    = (pair.get("priceChange") or {}).get("h1", 0) or 0
+    ch_h6    = (pair.get("priceChange") or {}).get("h6", 0) or 0
+    ch_h24   = (pair.get("priceChange") or {}).get("h24", 0) or 0
+    created  = pair.get("pairCreatedAt") or 0
+    info     = pair.get("info") or {}
+    socials  = info.get("socials") or []
+    websites = info.get("websites") or []
+    boosts   = pair.get("boosts") or {}
+    dex_paid = boosts.get("active", 0) or 0
+
+    age_min = ((time.time() * 1000) - created) / 60_000 if created else 9999
+
+    if dex_paid > 0:
+        greens.append(f"✅ DEX Paid ({dex_paid} boosts)")
         safety += 20
     else:
-        flags.append("❌ No DEX Paid — not boosted yet")
+        flags.append("❌ No DEX Paid")
         danger += 5
 
-    # 2️⃣ Liquidity
     if liq >= 50_000:
         greens.append(f"✅ Strong liquidity (${liq:,.0f})")
         safety += 15
@@ -196,78 +180,71 @@ def safety_check(pair: dict) -> tuple[str, list[str], int]:
         flags.append(f"⚠️ Low liquidity (${liq:,.0f})")
         danger += 10
     else:
-        flags.append(f"🚨 Very low liquidity (${liq:,.0f}) — easy rug")
+        flags.append(f"🚨 Very low liquidity (${liq:,.0f})")
         danger += 25
 
-    # 3️⃣ FDV / Liquidity ratio (honeypot indicator)
     if fdv > 0 and liq > 0:
         ratio = fdv / liq
         if ratio > 1000:
-            flags.append(f"🚨 FDV/Liq ratio {ratio:.0f}x — possible honeypot")
+            flags.append(f"🚨 FDV/Liq {ratio:.0f}x — honeypot risk")
             danger += 20
         elif ratio > 200:
-            flags.append(f"⚠️ FDV/Liq ratio {ratio:.0f}x — elevated risk")
+            flags.append(f"⚠️ FDV/Liq {ratio:.0f}x — elevated risk")
             danger += 10
         elif ratio < 20:
-            greens.append(f"✅ Healthy FDV/Liq ratio ({ratio:.0f}x)")
+            greens.append(f"✅ Healthy FDV/Liq ({ratio:.0f}x)")
             safety += 10
 
-    # 4️⃣ Token age
     if age_min < 10:
-        flags.append(f"🚨 Ultra new — only {age_min:.1f} min old (very high risk)")
+        flags.append(f"🚨 Only {age_min:.1f} min old — ultra new")
         danger += 15
     elif age_min < 60:
-        flags.append(f"⚠️ New token — {age_min:.0f} min old")
+        flags.append(f"⚠️ {age_min:.0f} min old — new token")
         danger += 8
-    elif age_min > 1440:   # > 1 day old and still has liquidity = good sign
+    elif age_min > 1440:
         greens.append(f"✅ Survived 24h+ ({age_min/60:.1f}h old)")
         safety += 10
 
-    # 5️⃣ Volume activity
     if vol_h1 > 50_000:
-        greens.append(f"✅ Hot volume — ${vol_h1:,.0f} in last 1h")
+        greens.append(f"✅ Hot volume ${vol_h1:,.0f}/1h")
         safety += 15
     elif vol_h1 > 10_000:
-        greens.append(f"⚠️ Growing volume — ${vol_h1:,.0f} in last 1h")
+        greens.append(f"⚠️ Growing volume ${vol_h1:,.0f}/1h")
         safety += 5
     elif vol_h1 < 500 and age_min > 30:
-        flags.append("❌ Almost no volume — nobody is buying")
+        flags.append("❌ Almost no volume")
         danger += 15
 
-    # 6️⃣ Socials (Twitter/Telegram presence)
     social_types = [s.get("type", "").lower() for s in socials]
-    has_twitter  = "twitter" in social_types
-    has_telegram = "telegram" in social_types
-    has_website  = len(websites) > 0
+    has_tw = "twitter" in social_types
+    has_tg = "telegram" in social_types
+    has_web = len(websites) > 0
 
-    if has_twitter and has_telegram and has_website:
-        greens.append("✅ Full socials (Twitter + Telegram + Website)")
+    if has_tw and has_tg and has_web:
+        greens.append("✅ Full socials (Twitter + TG + Website)")
         safety += 15
-    elif has_twitter and has_telegram:
-        greens.append("✅ Has Twitter + Telegram")
+    elif has_tw and has_tg:
+        greens.append("✅ Twitter + Telegram")
         safety += 10
-    elif has_twitter or has_telegram:
-        flags.append("⚠️ Only one social link found")
+    elif has_tw or has_tg:
+        flags.append("⚠️ Only one social found")
         danger += 5
     else:
-        flags.append("🚨 No social links — anonymous dev")
+        flags.append("🚨 No socials — anon dev")
         danger += 20
 
-    # 7️⃣ Extreme pump with low liquidity = classic rug setup
     if ch_h1 > 300 and liq < 30_000:
-        flags.append(f"🚨 300%+ pump in 1h with low liquidity — textbook rug setup")
+        flags.append("🚨 300%+ pump + low liq — rug setup")
         danger += 25
     elif ch_h1 > 100 and liq < 10_000:
-        flags.append(f"⚠️ Massive pump with very low liquidity")
+        flags.append("⚠️ Big pump + very low liq")
         danger += 15
 
-    # 8️⃣ Consistent growth (healthy signal)
     if ch_h1 > 5 and ch_h6 > 10 and ch_h24 > 20 and liq > 20_000:
-        greens.append("✅ Steady consistent growth across 1h/6h/24h")
+        greens.append("✅ Consistent growth 1h/6h/24h")
         safety += 10
 
-    # ── Score & Verdict
-    score = max(0, min(100, safety - danger + 30))  # baseline 30
+    score = max(0, min(100, safety - danger + 30))
 
     if danger >= 45 or (danger >= 25 and safety < 15):
         verdict = "🚨 LIKELY RUG"
@@ -276,12 +253,11 @@ def safety_check(pair: dict) -> tuple[str, list[str], int]:
     else:
         verdict = "✅ EARLY GEM"
 
-    all_flags = greens + flags
-    return verdict, all_flags, score
+    return verdict, greens + flags, score
 
 
 # ── Format Alert ──────────────────────────────────────────────────────────────
-def format_alert(pair: dict, trigger: str, verdict: str, flags: list[str], score: int) -> str:
+def format_alert(pair, trigger, verdict, flags, score):
     base     = pair.get("baseToken") or {}
     name     = base.get("name", "Unknown")
     symbol   = base.get("symbol", "?")
@@ -294,133 +270,269 @@ def format_alert(pair: dict, trigger: str, verdict: str, flags: list[str], score
     ch_h1    = (pair.get("priceChange") or {}).get("h1", 0) or 0
     ch_h6    = (pair.get("priceChange") or {}).get("h6", 0) or 0
     ch_h24   = (pair.get("priceChange") or {}).get("h24", 0) or 0
-    txns_h1  = ((pair.get("txns") or {}).get("h1") or {})
-    buys_h1  = txns_h1.get("buys", 0)
-    sells_h1 = txns_h1.get("sells", 0)
+    txns     = ((pair.get("txns") or {}).get("h1") or {})
+    buys     = txns.get("buys", 0)
+    sells    = txns.get("sells", 0)
     url      = pair.get("url", "")
     created  = pair.get("pairCreatedAt") or 0
     age_min  = int(((time.time() * 1000) - created) / 60_000) if created else 0
     age_str  = f"{age_min}m" if age_min < 120 else f"{age_min//60}h {age_min%60}m"
+    bar      = "🟢" * (score // 20) + "⚪" * (5 - score // 20)
+    flags_text = "\n".join(flags) if flags else "None"
 
-    flags_text = "\n".join(flags) if flags else "—"
-    score_bar  = "🟢" * (score // 20) + "⚪" * (5 - score // 20)
-
-    msg = f"""
-⚽ <b>WC MEMECOIN ALERT</b> ⚽
+    return f"""⚽ <b>WC MEMECOIN ALERT</b> ⚽
 ━━━━━━━━━━━━━━━━━━━━
 🪙 <b>{name} (${symbol})</b>
-🔗 Chain: {chain}
-⏱ Age: {age_str}
+🔗 Chain: {chain} | ⏱ Age: {age_str}
 📢 <b>{trigger}</b>
 
 💰 Price: ${price}
 📊 1h: {ch_h1:+.1f}% | 6h: {ch_h6:+.1f}% | 24h: {ch_h24:+.1f}%
 💧 Liquidity: ${liq:,.0f}
-📦 Vol 1h: ${vol_h1:,.0f} | Vol 24h: ${vol_h24:,.0f}
-🔄 Buys/Sells (1h): {buys_h1} / {sells_h1}
+📦 Vol 1h: ${vol_h1:,.0f} | 24h: ${vol_h24:,.0f}
+🔄 Buys/Sells (1h): {buys} / {sells}
 
 🛡 Safety: {verdict}
-{score_bar} Score: {score}/100
+{bar} Score: {score}/100
 {flags_text}
 
 🔍 <a href="{url}">DEXScreener</a>
 📋 CA: <code>{address}</code>
 ━━━━━━━━━━━━━━━━━━━━
-⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}
-""".strip()
-    return msg
+⏰ {datetime.now(timezone.utc).strftime("%H:%M:%S UTC")}"""
 
 
-# ── Main Scan ─────────────────────────────────────────────────────────────────
-def scan():
-    log.info("🔍 Scanning...")
-    checked   = set()
-    alerted   = 0
+# ── Commands ──────────────────────────────────────────────────────────────────
+HELP_TEXT = """⚽ <b>WC Memecoin Bot v3 Commands</b> ⚽
+━━━━━━━━━━━━━━━━━━━━
 
-    for kw in WC_KEYWORDS:
-        pairs = dex_search(kw)
+<b>⚙️ Scan Controls</b>
+/interval [secs] — set scan speed (e.g. /interval 30)
+/pause — pause scanning
+/resume — resume scanning
+/status — show current bot settings
 
-        for pair in pairs:
-            chain   = pair.get("chainId", "")
-            if chain not in CHAINS:
-                continue
+<b>🔗 Chain Filter</b>
+/chain solana — scan only Solana
+/chain bsc — scan only BSC
+/chain base — scan only Base
+/chain eth — scan only Ethereum
+/chain all — scan all chains
 
-            address = (pair.get("baseToken") or {}).get("address", "")
-            if not address or address in checked:
-                continue
-            checked.add(address)
+<b>📊 Alert Filters</b>
+/threshold [%] — set pump/dump alert % (e.g. /threshold 20)
+/minliq [amount] — min liquidity in USD (e.g. /minliq 5000)
+/maxage [mins] — only show tokens under X mins old (e.g. /maxage 60)
+/maxage off — remove age filter
+/safeonly on — only show EARLY GEM tokens
+/safeonly off — show all tokens
+/newonly on — only alert on brand new launches
+/newonly off — show pumps/dumps too
+/charts on — include chart image in alerts
+/charts off — text only alerts
 
-            # Skip stables / wrapped natives
-            sym = (pair.get("baseToken") or {}).get("symbol", "").upper()
-            if sym in {"USDT","USDC","BUSD","DAI","WETH","WBNB","WSOL","ETH","BNB","SOL"}:
-                continue
+<b>🔍 Token Lookup</b>
+/check [CA] — check any token by contract address
+/top — top 5 WC tokens by volume right now
+/trending — what is pumping hardest this hour
 
+<b>📌 Watchlist</b>
+/watch [CA] — add token to watchlist
+/unwatch [CA] — remove from watchlist
+/watchlist — show your watchlist
+
+<b>🔄 Reset</b>
+/reset — reset ALL settings to default
+
+━━━━━━━━━━━━━━━━━━━━
+Bot scans every {interval}s on: {chains}"""
+
+
+def handle_command(chat_id, text):
+    text = text.strip()
+    parts = text.split()
+    cmd = parts[0].lower().split("@")[0]
+
+    if cmd == "/start" or cmd == "/help":
+        chains_str = ", ".join(settings["chains"]).upper()
+        reply = HELP_TEXT.format(
+            interval=settings["interval"],
+            chains=chains_str,
+        )
+        send(chat_id, reply)
+
+    elif cmd == "/status":
+        chains_str = ", ".join(settings["chains"]).upper()
+        send(chat_id, f"""⚙️ <b>Bot Status</b>
+━━━━━━━━━━━━━━━━━━━━
+{'⏸ PAUSED' if settings['paused'] else '▶️ RUNNING'}
+⏱ Scan interval: {settings['interval']}s
+🔗 Chains: {chains_str}
+📊 Alert threshold: {settings['threshold']}%
+💧 Min liquidity: ${settings['min_liq']:,}
+⏳ Max age: {str(settings['max_age']) + ' min' if settings['max_age'] else 'Off'}
+🛡 Safe only: {'On' if settings['safe_only'] else 'Off'}
+🆕 New only: {'On' if settings['new_only'] else 'Off'}
+📸 Charts: {'On' if settings['charts'] else 'Off'}
+📌 Watchlist: {len(watchlist)} tokens
+━━━━━━━━━━━━━━━━━━━━""")
+
+    elif cmd == "/pause":
+        settings["paused"] = True
+        send(chat_id, "⏸ Bot paused. Send /resume to restart scanning.")
+
+    elif cmd == "/resume":
+        settings["paused"] = False
+        send(chat_id, "▶️ Bot resumed! Scanning every " + str(settings["interval"]) + "s.")
+
+    elif cmd == "/interval":
+        if len(parts) < 2 or not parts[1].isdigit():
+            send(chat_id, "Usage: /interval [seconds] — e.g. /interval 60")
+            return
+        val = int(parts[1])
+        if val < 10:
+            send(chat_id, "⚠️ Minimum interval is 10 seconds.")
+            return
+        settings["interval"] = val
+        send(chat_id, f"✅ Scan interval set to {val} seconds.")
+
+    elif cmd == "/threshold":
+        if len(parts) < 2 or not parts[1].replace(".", "").isdigit():
+            send(chat_id, "Usage: /threshold [%] — e.g. /threshold 20")
+            return
+        settings["threshold"] = float(parts[1])
+        send(chat_id, f"✅ Alert threshold set to {settings['threshold']}%.")
+
+    elif cmd == "/minliq":
+        if len(parts) < 2 or not parts[1].isdigit():
+            send(chat_id, "Usage: /minliq [amount] — e.g. /minliq 5000")
+            return
+        settings["min_liq"] = int(parts[1])
+        send(chat_id, f"✅ Minimum liquidity set to ${settings['min_liq']:,}.")
+
+    elif cmd == "/maxage":
+        if len(parts) < 2:
+            send(chat_id, "Usage: /maxage [mins] or /maxage off")
+            return
+        if parts[1].lower() == "off":
+            settings["max_age"] = None
+            send(chat_id, "✅ Max age filter removed.")
+        elif parts[1].isdigit():
+            settings["max_age"] = int(parts[1])
+            send(chat_id, f"✅ Only showing tokens under {settings['max_age']} minutes old.")
+        else:
+            send(chat_id, "Usage: /maxage [mins] or /maxage off")
+
+    elif cmd == "/safeonly":
+        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
+            send(chat_id, "Usage: /safeonly on or /safeonly off")
+            return
+        settings["safe_only"] = parts[1].lower() == "on"
+        send(chat_id, f"✅ Safe only: {'On — only showing EARLY GEM tokens.' if settings['safe_only'] else 'Off — showing all tokens.'}")
+
+    elif cmd == "/newonly":
+        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
+            send(chat_id, "Usage: /newonly on or /newonly off")
+            return
+        settings["new_only"] = parts[1].lower() == "on"
+        send(chat_id, f"✅ New only: {'On — only alerting on new launches.' if settings['new_only'] else 'Off — alerting on pumps/dumps too.'}")
+
+    elif cmd == "/charts":
+        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
+            send(chat_id, "Usage: /charts on or /charts off")
+            return
+        settings["charts"] = parts[1].lower() == "on"
+        send(chat_id, f"✅ Charts: {'On' if settings['charts'] else 'Off'}.")
+
+    elif cmd == "/chain":
+        if len(parts) < 2:
+            send(chat_id, "Usage: /chain [solana|bsc|base|eth|all]")
+            return
+        val = parts[1].lower()
+        chain_map = {"solana": ["solana"], "bsc": ["bsc"], "base": ["base"], "eth": ["ethereum"], "all": ALL_CHAINS}
+        if val not in chain_map:
+            send(chat_id, "Options: solana, bsc, base, eth, all")
+            return
+        settings["chains"] = chain_map[val]
+        send(chat_id, f"✅ Now scanning: {', '.join(settings['chains']).upper()}")
+
+    elif cmd == "/reset":
+        settings.update({
+            "interval": 30, "threshold": 20, "min_liq": 1000,
+            "max_age": None, "chains": ALL_CHAINS[:],
+            "safe_only": False, "new_only": False,
+            "paused": False, "charts": True,
+        })
+        send(chat_id, "✅ All settings reset to default!")
+
+    elif cmd == "/check":
+        if len(parts) < 2:
+            send(chat_id, "Usage: /check [contract address]")
+            return
+        address = parts[1]
+        send(chat_id, "🔍 Checking token...")
+        pair = dex_by_address(address)
+        if not pair:
+            send(chat_id, "❌ Token not found on DEXScreener.")
+            return
+        verdict, flags, score = safety_check(pair)
+        msg = format_alert(pair, "📋 Manual Check", verdict, flags, score)
+        photo = chart_url(pair)
+        send(chat_id, msg, photo)
+
+    elif cmd == "/watch":
+        if len(parts) < 2:
+            send(chat_id, "Usage: /watch [contract address]")
+            return
+        watchlist.add(parts[1].lower())
+        send(chat_id, f"📌 Added to watchlist! You now have {len(watchlist)} tokens watched.")
+
+    elif cmd == "/unwatch":
+        if len(parts) < 2:
+            send(chat_id, "Usage: /unwatch [contract address]")
+            return
+        watchlist.discard(parts[1].lower())
+        send(chat_id, f"✅ Removed from watchlist.")
+
+    elif cmd == "/watchlist":
+        if not watchlist:
+            send(chat_id, "📌 Your watchlist is empty. Use /watch [CA] to add tokens.")
+            return
+        items = "\n".join([f"• <code>{ca}</code>" for ca in watchlist])
+        send(chat_id, f"📌 <b>Watchlist ({len(watchlist)} tokens)</b>\n{items}")
+
+    elif cmd == "/top":
+        send(chat_id, "🔍 Fetching top WC tokens by volume...")
+        results = []
+        for kw in ["worldcup", "wc2026", "fifa", "mbappe", "messi"]:
+            for pair in dex_search(kw):
+                if pair.get("chainId") in settings["chains"]:
+                    vol = (pair.get("volume") or {}).get("h24", 0) or 0
+                    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+                    if liq > 1000:
+                        results.append((vol, pair))
+        results.sort(key=lambda x: x[0], reverse=True)
+        if not results:
+            send(chat_id, "No WC tokens found right now.")
+            return
+        msg = "🏆 <b>Top 5 WC Tokens by Volume (24h)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        for i, (vol, pair) in enumerate(results[:5], 1):
+            base = pair.get("baseToken") or {}
+            name = base.get("name", "?")
+            sym = base.get("symbol", "?")
+            ch24 = (pair.get("priceChange") or {}).get("h24", 0) or 0
             liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-            if liq < MIN_LIQUIDITY:
-                continue
+            url = pair.get("url", "")
+            msg += f"{i}. <b>{name} (${sym})</b>\n"
+            msg += f"   Vol: ${vol:,.0f} | Liq: ${liq:,.0f} | 24h: {ch24:+.1f}%\n"
+            msg += f"   <a href=\"{url}\">Chart</a>\n\n"
+        send(chat_id, msg)
 
-            ch_h1  = (pair.get("priceChange") or {}).get("h1", 0) or 0
-            price  = float(pair.get("priceUsd") or 0)
-            prev   = seen.get(address, {})
-
-            # ── Decide trigger ──────────────────────────────────────────────
-            trigger  = None
-            now      = time.time()
-            last_alert = prev.get("last_alert", 0)
-            cooldown   = 1800   # 30 min cooldown per token
-
-            created_ms = pair.get("pairCreatedAt") or 0
-            age_min    = ((now * 1000) - created_ms) / 60_000 if created_ms else 9999
-
-            if address not in seen:
-                trigger = "🆕 NEW WC TOKEN DETECTED"
-            elif abs(ch_h1) >= PRICE_ALERT_PCT and (now - last_alert) > cooldown:
-                direction = "🚀 PUMPING" if ch_h1 > 0 else "💀 DUMPING"
-                trigger   = f"{direction} {ch_h1:+.1f}% in 1h"
-
-            if not trigger:
-                seen[address] = {**prev, "last_price": price}
-                continue
-
-            # ── Run safety check ────────────────────────────────────────────
-            verdict, flags, score = safety_check(pair)
-
-            # Don't alert on ultra-low score obvious rugs unless it's a new find
-            if score < 15 and "NEW" not in trigger:
-                seen[address] = {**prev, "last_price": price, "last_alert": now}
-                continue
-
-            msg = format_alert(pair, trigger, verdict, flags, score)
-            send_telegram(msg)
-
-            seen[address] = {
-                "first_seen": prev.get("first_seen", now),
-                "last_alert": now,
-                "last_price": price,
-            }
-            alerted += 1
-            time.sleep(0.3)   # Telegram rate limit safety
-
-    log.info(f"✅ Done — {len(checked)} tokens checked, {alerted} alerts sent")
-
-
-# ── Entry Point ───────────────────────────────────────────────────────────────
-def main():
-    log.info("🤖 WC Memecoin Bot v2 starting...")
-    send_telegram(
-        "🤖 <b>WC Memecoin Bot v2 is LIVE!</b>\n"
-        "⚽ Scanning every 30s across Solana, BSC, Base & ETH\n"
-        "🔍 Checking: DEX Paid · Liquidity · Holders · Socials · Honeypot signals\n"
-        "Let's catch these WC gems early! 🌍"
-    )
-    while True:
-        try:
-            scan()
-        except Exception as e:
-            log.error(f"Scan crashed: {e}")
-        log.info(f"💤 Next scan in {SCAN_INTERVAL}s...")
-        time.sleep(SCAN_INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
+    elif cmd == "/trending":
+        send(chat_id, "🔍 Finding what is pumping hardest this hour...")
+        results = []
+        for kw in WC_KEYWORDS[:20]:
+            for pair in dex_search(kw):
+                if pair.get("chainId") in settings["chains"]:
+                    ch1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
+                    liq = (pair.get("liquidity")
