@@ -535,7 +535,8 @@ def handle_command(chat_id, text):
             for pair in dex_search(kw):
                 if pair.get("chainId") in settings["chains"]:
                     ch1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
-                    liq = (pair.get("liquidity")
+                    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+
 if liq > 1000 and ch1 > 0:
                         results.append((ch1, pair))
         results.sort(key=lambda x: x[0], reverse=True)
