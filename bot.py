@@ -1,4 +1,4 @@
-“””
+"""
 ⚽ WC Memecoin Bot v2
 
 - Scans every 30s for new World Cup tokens
@@ -6,7 +6,7 @@
 - Checks DEX Paid, liquidity lock, holder concentration,
   socials, honeypot signals, age, volume, and more
 - Sends rich Telegram alerts instantly
-  “””
+  """
 
 import os
 import time
