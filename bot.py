@@ -536,3 +536,137 @@ def handle_command(chat_id, text):
                 if pair.get("chainId") in settings["chains"]:
                     ch1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
                     liq = (pair.get("liquidity")
+if liq > 1000 and ch1 > 0:
+                        results.append((ch1, pair))
+        results.sort(key=lambda x: x[0], reverse=True)
+        if not results:
+            send(chat_id, "Nothing significant pumping right now.")
+            return
+        msg = "🚀 <b>Trending WC Tokens (1h Pump)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        for i, (ch1, pair) in enumerate(results[:5], 1):
+            base = pair.get("baseToken") or {}
+            name = base.get("name", "?")
+            sym = base.get("symbol", "?")
+            liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+            url = pair.get("url", "")
+            msg += f"{i}. <b>{name} (${sym})</b> +{ch1:.1f}%\n"
+            msg += f"   Liq: ${liq:,.0f} | <a href=\"{url}\">Chart</a>\n\n"
+        send(chat_id, msg)
+
+
+def poll_commands():
+    global last_update_id
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": last_update_id + 1, "timeout": 5},
+            timeout=10,
+        )
+        updates = r.json().get("result", [])
+        for update in updates:
+            last_update_id = update["update_id"]
+            msg = update.get("message") or update.get("channel_post") or {}
+            text = msg.get("text", "")
+            chat_id = (msg.get("chat") or {}).get("id")
+            if text.startswith("/") and chat_id:
+                handle_command(str(chat_id), text)
+    except Exception as e:
+        log.error(f"Poll error: {e}")
+
+
+def scan():
+    if settings["paused"]:
+        return
+    log.info("Scanning...")
+    checked = set()
+    alerted = 0
+    for ca in list(watchlist):
+        pair = dex_by_address(ca)
+        if pair:
+            address = (pair.get("baseToken") or {}).get("address", "")
+            if address:
+                checked.add(address)
+                ch_h1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
+                if abs(ch_h1) >= settings["threshold"]:
+                    verdict, flags, score = safety_check(pair)
+                    direction = "🚀 PUMPING" if ch_h1 > 0 else "💀 DUMPING"
+                    trigger = f"📌 WATCHLIST — {direction} {ch_h1:+.1f}% in 1h"
+                    msg = format_alert(pair, trigger, verdict, flags, score)
+                    broadcast(msg, chart_url(pair))
+                    alerted += 1
+    for kw in WC_KEYWORDS:
+        for pair in dex_search(kw):
+            chain = pair.get("chainId", "")
+            if chain not in settings["chains"]:
+                continue
+            address = (pair.get("baseToken") or {}).get("address", "")
+            if not address or address in checked:
+                continue
+            checked.add(address)
+            sym = (pair.get("baseToken") or {}).get("symbol", "").upper()
+            if sym in {"USDT","USDC","BUSD","DAI","WETH","WBNB","WSOL","ETH","BNB","SOL"}:
+                continue
+            liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+            if liq < settings["min_liq"]:
+                continue
+            created_ms = pair.get("pairCreatedAt") or 0
+            age_min = ((time.time() * 1000) - created_ms) / 60_000 if created_ms else 9999
+            if settings["max_age"] and age_min > settings["max_age"]:
+                continue
+            ch_h1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
+            price = float(pair.get("priceUsd") or 0)
+            prev = seen.get(address, {})
+            now = time.time()
+            last_alert = prev.get("last_alert", 0)
+            cooldown = 1800
+            trigger = None
+            if address not in seen:
+                trigger = "🆕 NEW WC TOKEN DETECTED"
+            elif abs(ch_h1) >= settings["threshold"] and (now - last_alert) > cooldown:
+                direction = "🚀 PUMPING" if ch_h1 > 0 else "💀 DUMPING"
+                trigger = f"{direction} {ch_h1:+.1f}% in 1h"
+            if not trigger:
+                seen[address] = {**prev, "last_price": price}
+                continue
+            if settings["new_only"] and "NEW" not in trigger:
+                seen[address] = {**prev, "last_price": price}
+                continue
+            verdict, flags, score = safety_check(pair)
+            if settings["safe_only"] and verdict != "✅ EARLY GEM":
+                seen[address] = {**prev, "last_price": price, "last_alert": now}
+                continue
+            if score < 15 and "NEW" not in trigger:
+                seen[address] = {**prev, "last_price": price, "last_alert": now}
+                continue
+            msg = format_alert(pair, trigger, verdict, flags, score)
+            broadcast(msg, chart_url(pair))
+            seen[address] = {
+                "first_seen": prev.get("first_seen", now),
+                "last_alert": now,
+                "last_price": price,
+            }
+            alerted += 1
+            time.sleep(0.3)
+    log.info(f"Done — {len(checked)} checked, {alerted} alerts sent")
+
+
+def main():
+    log.info("WC Memecoin Bot v3 starting...")
+    broadcast(
+        "🤖 <b>WC Memecoin Bot v3 is LIVE!</b>\n"
+        "⚽ Scanning every 30s across Solana, BSC, Base and ETH\n\n"
+        "Send /help to see all commands 👇"
+    )
+    while True:
+        try:
+            poll_commands()
+            scan()
+        except Exception as e:
+            log.error(f"Main loop error: {e}")
+        time.sleep(settings["interval"])
+
+
+if __name__ == "__main__":
+    main()
