@@ -2,9 +2,11 @@ import os
 import asyncio
 import json
 import time
+import io
 import requests
 import logging
 import websockets
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timezone
 from collections import deque, defaultdict
 
@@ -74,14 +76,12 @@ total_scans = 0
 alert_times = deque()
 last_tg_send = 0
 
-# Track early buy activity per token mint
 token_activity: dict = defaultdict(lambda: {
     "buys": 0, "sells": 0, "wallets": set(),
     "volume_sol": 0.0, "first_seen": time.time(),
     "dev_sold": False, "bonding_pct": 0.0,
     "name": "", "symbol": "", "mint": "",
 })
-
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────────
 def can_alert():
@@ -90,10 +90,8 @@ def can_alert():
         alert_times.popleft()
     return len(alert_times) < settings["max_alerts_hr"]
 
-
 def record_alert():
     alert_times.append(time.time())
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def is_wc_token(name="", symbol=""):
@@ -104,58 +102,209 @@ def is_wc_token(name="", symbol=""):
             return True
     return False
 
-
 def is_stable(symbol):
     return symbol.upper() in {"USDT","USDC","BUSD","DAI","WETH","WBNB","WSOL","ETH","BNB","SOL","WBTC"}
 
+# ── Image Card Generator ──────────────────────────────────────────────────────
+BOLD_FONT = "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+REG_FONT  = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+
+def _rounded_rect(draw, xy, radius, fill, outline=None, width=1):
+    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
+
+def _score_color(score):
+    if score >= 60: return "#22c55e"
+    if score >= 35: return "#f59e0b"
+    return "#ef4444"
+
+def make_alert_card(data: dict) -> bytes:
+    W, H   = 620, 400
+    BG     = "#0d1117"
+    CARD   = "#161b22"
+    BORDER = "#30363d"
+    WHITE  = "#f0f6fc"
+    MUTED  = "#8b949e"
+    GREEN  = "#22c55e"
+    RED    = "#ef4444"
+    PURPLE = "#a855f7"
+    SOCCER = "#3b82f6"
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    f_huge = ImageFont.truetype(BOLD_FONT, 26)
+    f_big  = ImageFont.truetype(BOLD_FONT, 20)
+    f_med  = ImageFont.truetype(BOLD_FONT, 15)
+    f_tiny = ImageFont.truetype(REG_FONT,  11)
+
+    _rounded_rect(draw, [10,10,W-10,H-10], 12, CARD, BORDER, 1)
+    _rounded_rect(draw, [10,10,W-10,58],   12, "#1a2332")
+    draw.rectangle([10,46,W-10,58], fill="#1a2332")
+
+    is_wc  = data.get("is_wc", False)
+    is_gem = data.get("is_gem", False)
+    if is_wc:
+        hdr_color, hdr_text = SOCCER, "WC MEMECOIN ALERT"
+    elif is_gem:
+        hdr_color, hdr_text = PURPLE, "EARLY GEM ALERT"
+    else:
+        hdr_color, hdr_text = GREEN, "TOKEN ALERT"
+    draw.text((24, 18), hdr_text, font=f_big, fill=hdr_color)
+
+    chain = data.get("chain","SOL").upper()
+    chain_colors = {"SOLANA":"#9945ff","BSC":"#f0b90b","BASE":"#0052ff","ETHEREUM":"#627eea"}
+    cbg = chain_colors.get(chain, "#444")
+    cw  = draw.textlength(chain, font=f_tiny) + 14
+    _rounded_rect(draw, [W-24-cw,20,W-20,40], 6, cbg)
+    draw.text((W-20-cw+7, 23), chain, font=f_tiny, fill=WHITE)
+
+    name   = data.get("name","Unknown")[:22]
+    symbol = data.get("symbol","?")
+    draw.text((24, 68), name, font=f_huge, fill=WHITE)
+    sym_x = 26 + draw.textlength(name, font=f_huge) + 8
+    draw.text((sym_x, 74), f"${symbol}", font=f_med, fill=MUTED)
+
+    age_txt = f"Age: {data.get('age','?')}"
+    _rounded_rect(draw,[24,102,24+draw.textlength(age_txt,font=f_tiny)+12,120],6,"#21262d")
+    draw.text((30,104), age_txt, font=f_tiny, fill=MUTED)
+
+    draw.line([(24,128),(W-24,128)], fill=BORDER, width=1)
+
+    draw.text((24,138), "PRICE", font=f_tiny, fill=MUTED)
+    draw.text((24,154), f"${data.get('price','?')}", font=f_big, fill=WHITE)
+    mc = data.get("mc",0)
+    if mc:
+        mc_str = f"${mc/1_000_000:.2f}M" if mc >= 1_000_000 else f"${mc:,.0f}"
+        draw.text((200,138), "MARKET CAP", font=f_tiny, fill=MUTED)
+        draw.text((200,154), mc_str, font=f_big, fill=WHITE)
+
+    x = 24
+    for label, val in [("1H",data.get("ch1",0)),("6H",data.get("ch6",0)),("24H",data.get("ch24",0))]:
+        col  = GREEN if val >= 0 else RED
+        sign = "+" if val >= 0 else ""
+        _rounded_rect(draw,[x,192,x+90,228],8,"#21262d")
+        draw.text((x+8,196), label,               font=f_tiny, fill=MUTED)
+        draw.text((x+8,209), f"{sign}{val:.1f}%", font=f_med,  fill=col)
+        x += 100
+
+    draw.text((24,240),  "LIQUIDITY",                    font=f_tiny, fill=MUTED)
+    draw.text((24,254),  f"${data.get('liq',0):,.0f}",  font=f_med,  fill=WHITE)
+    draw.text((200,240), "VOL 1H",                       font=f_tiny, fill=MUTED)
+    draw.text((200,254), f"${data.get('vol1h',0):,.0f}", font=f_med,  fill=WHITE)
+
+    buys  = data.get("buys",0)
+    sells = data.get("sells",0)
+    total = buys + sells
+    draw.text((24,280), f"BUYS {buys}  /  SELLS {sells}", font=f_tiny, fill=MUTED)
+    if total > 0:
+        bar_w = W - 48
+        buy_w = int(bar_w * buys / total)
+        _rounded_rect(draw,[24,294,24+buy_w,306],4,GREEN)
+        if buy_w < bar_w:
+            _rounded_rect(draw,[24+buy_w,294,24+bar_w,306],4,RED)
+
+    draw.line([(24,316),(W-24,316)], fill=BORDER, width=1)
+
+    score   = data.get("score",0)
+    verdict = data.get("verdict","?")
+    scol    = _score_color(score)
+    draw.text((24,326), "SAFETY SCORE", font=f_tiny, fill=MUTED)
+    draw.text((24,340), verdict,         font=f_med,  fill=scol)
+    for i in range(5):
+        cx  = W-120+i*22
+        col = scol if i < score//20 else "#21262d"
+        draw.ellipse([cx,336,cx+14,350], fill=col)
+    draw.text((W-30,340), str(score), font=f_med, fill=scol)
+
+    draw.text((24,H-28),    data.get("trigger",""), font=f_tiny, fill=MUTED)
+    draw.text((W-160,H-28), data.get("time",""),    font=f_tiny, fill=MUTED)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+def build_card_data(pair, trigger, verdict, score, wc, gem):
+    base    = pair.get("baseToken") or {}
+    created = pair.get("pairCreatedAt") or 0
+    age_min = int(((time.time() * 1000) - created) / 60_000) if created else 0
+    age_str = f"{age_min}m" if age_min < 120 else f"{age_min//60}h {age_min%60}m"
+    return {
+        "name":    base.get("name",""),
+        "symbol":  base.get("symbol",""),
+        "chain":   pair.get("chainId","solana").upper(),
+        "price":   pair.get("priceUsd","?"),
+        "mc":      pair.get("marketCap") or pair.get("fdv") or 0,
+        "ch1":     (pair.get("priceChange") or {}).get("h1",0) or 0,
+        "ch6":     (pair.get("priceChange") or {}).get("h6",0) or 0,
+        "ch24":    (pair.get("priceChange") or {}).get("h24",0) or 0,
+        "liq":     (pair.get("liquidity") or {}).get("usd",0) or 0,
+        "vol1h":   (pair.get("volume") or {}).get("h1",0) or 0,
+        "buys":    ((pair.get("txns") or {}).get("h1") or {}).get("buys",0),
+        "sells":   ((pair.get("txns") or {}).get("h1") or {}).get("sells",0),
+        "score":   score,
+        "verdict": verdict,
+        "age":     age_str,
+        "is_wc":   wc,
+        "is_gem":  gem,
+        "trigger": trigger,
+        "time":    datetime.now(timezone.utc).strftime("%H:%M UTC"),
+    }
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-def send_tg(chat_id, text, photo_url=None):
+def send_tg(chat_id, text, photo_url=None, card_data=None):
     global last_tg_send
     wait = 3 - (time.time() - last_tg_send)
     if wait > 0:
         time.sleep(wait)
     try:
-        if photo_url and settings["charts"]:
+        # Try sending generated image card first
+        if card_data and settings.get("charts", True):
+            try:
+                img_bytes = make_alert_card(card_data)
+                buf = io.BytesIO(img_bytes)
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                    data={"chat_id": chat_id, "caption": text[:1024], "parse_mode": "HTML"},
+                    files={"photo": ("alert.png", buf, "image/png")},
+                    timeout=20,
+                )
+                last_tg_send = time.time()
+                if r.ok:
+                    return
+            except Exception as img_err:
+                log.error(f"Card error: {img_err}")
+
+        # Fallback to photo_url
+        if photo_url and settings.get("charts", True):
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                json={
-                    "chat_id": chat_id,
-                    "photo": photo_url,
-                    "caption": text[:1024],
-                    "parse_mode": "HTML",
-                },
+                json={"chat_id": chat_id, "photo": photo_url,
+                      "caption": text[:1024], "parse_mode": "HTML"},
                 timeout=15,
             )
             last_tg_send = time.time()
             if r.ok:
                 return
+
+        # Fallback to text only
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         ).raise_for_status()
         last_tg_send = time.time()
     except Exception as e:
         log.error(f"TG error: {e}")
 
-
-def broadcast(text, photo_url=None):
-    send_tg(TELEGRAM_CHAT_ID, text, photo_url)
-
+def broadcast(text, photo_url=None, card_data=None):
+    send_tg(TELEGRAM_CHAT_ID, text, photo_url, card_data)
 
 # ── DEXScreener ───────────────────────────────────────────────────────────────
 def dex_get(mint):
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-            timeout=10,
-        )
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=10)
         r.raise_for_status()
         pairs = r.json().get("pairs", []) or []
         if pairs:
@@ -164,22 +313,16 @@ def dex_get(mint):
     except Exception:
         return {}
 
-
 def dex_search(keyword):
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/search?q={keyword}",
-            timeout=10,
-        )
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={keyword}", timeout=10)
         r.raise_for_status()
         return r.json().get("pairs", []) or []
     except Exception:
         return []
 
-
 def chart_url(mint, chain="solana"):
     return f"https://dexscreener.com/{chain}/{mint}/chart.png"
-
 
 # ── Rug Score ─────────────────────────────────────────────────────────────────
 def rug_score(pair, gem_mode=False, activity=None):
@@ -206,7 +349,6 @@ def rug_score(pair, gem_mode=False, activity=None):
     sells_h1 = txns_h1.get("sells", 0) or 0
     age_min  = ((time.time() * 1000) - created) / 60_000 if created else 9999
 
-    # Pump.fun early activity bonus
     if activity:
         unique_wallets = len(activity.get("wallets", set()))
         if unique_wallets >= 20:
@@ -232,7 +374,6 @@ def rug_score(pair, gem_mode=False, activity=None):
             flags.append(f"⚠️ Bonding curve only {bc:.0f}%")
             danger += 5
 
-    # DEX Paid
     if dex_paid > 0:
         greens.append(f"✅ DEX Paid ({dex_paid} boosts)")
         safety += 20
@@ -240,7 +381,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         flags.append("❌ No DEX Paid")
         danger += 5
 
-    # Liquidity
     if liq >= 50_000:
         greens.append(f"✅ Strong liquidity (${liq:,.0f})")
         safety += 15
@@ -254,7 +394,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         flags.append(f"🚨 Very low liquidity (${liq:,.0f})")
         danger += 20
 
-    # MC/Liq
     if mc > 0 and liq > 0:
         mc_liq = mc / liq
         if mc_liq < 5 and gem_mode:
@@ -267,7 +406,6 @@ def rug_score(pair, gem_mode=False, activity=None):
             flags.append(f"🚨 MC/Liq {mc_liq:.0f}x — overvalued")
             danger += 20
 
-    # FDV/Liq honeypot
     if fdv > 0 and liq > 0:
         ratio = fdv / liq
         if ratio > 1000:
@@ -280,7 +418,6 @@ def rug_score(pair, gem_mode=False, activity=None):
             greens.append(f"✅ Healthy FDV/Liq ({ratio:.0f}x)")
             safety += 8
 
-    # Age
     if age_min < 10:
         flags.append(f"🚨 Only {age_min:.0f} min old")
         danger += 8
@@ -291,7 +428,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         greens.append(f"✅ Survived 24h+ ({age_min/60:.0f}h old)")
         safety += 10
 
-    # Buy pressure
     total_txns = buys_h1 + sells_h1
     if total_txns > 0:
         buy_ratio = buys_h1 / total_txns
@@ -305,7 +441,6 @@ def rug_score(pair, gem_mode=False, activity=None):
             flags.append(f"🚨 Mostly sells ({sells_h1} vs {buys_h1} buys)")
             danger += 15
 
-    # Volume
     if vol_h1 > 50_000:
         greens.append(f"✅ Hot volume ${vol_h1:,.0f}/1h")
         safety += 15
@@ -319,7 +454,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         flags.append("❌ Almost no volume")
         danger += 15
 
-    # Socials
     social_types = [s.get("type", "").lower() for s in socials]
     has_tw  = "twitter" in social_types
     has_tg  = "telegram" in social_types
@@ -337,7 +471,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         flags.append("🚨 No socials — anon dev")
         danger += 20
 
-    # Rug pump pattern
     if ch_h1 > 300 and liq < 30_000:
         flags.append("🚨 300%+ pump + low liq — rug setup")
         danger += 25
@@ -345,7 +478,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         flags.append("⚠️ Big pump + very low liq")
         danger += 15
 
-    # Consistent growth
     if ch_h1 > 5 and ch_h6 > 10 and ch_h24 > 20 and liq > 5_000:
         greens.append("✅ Consistent growth 1h/6h/24h")
         safety += 10
@@ -362,7 +494,6 @@ def rug_score(pair, gem_mode=False, activity=None):
         verdict = "✅ LOOKS GOOD"
 
     return verdict, greens + flags, score
-
 
 # ── Format Alert ──────────────────────────────────────────────────────────────
 def format_alert(pair, trigger, verdict, flags, score, is_wc=False, is_gem=False, activity=None):
@@ -398,7 +529,6 @@ def format_alert(pair, trigger, verdict, flags, score, is_wc=False, is_gem=False
     else:
         header = "🚀 <b>TOKEN ALERT</b> 🚀"
 
-    # Add pump.fun early activity if available
     activity_line = ""
     if activity:
         wallets = len(activity.get("wallets", set()))
@@ -427,7 +557,6 @@ def format_alert(pair, trigger, verdict, flags, score, is_wc=False, is_gem=False
 ━━━━━━━━━━━━━━━━━━━━
 ⏰ {datetime.now(timezone.utc).strftime("%H:%M:%S UTC")} | {alerts_left} alerts left this hr"""
 
-
 # ── Help Text ─────────────────────────────────────────────────────────────────
 HELP_TEXT = """🤖 <b>Alpha Bot Commands</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -437,7 +566,6 @@ HELP_TEXT = """🤖 <b>Alpha Bot Commands</b>
 /resume — resume alerts
 /status — current settings
 /uptime — runtime stats
-/runtime — same as /uptime
 
 <b>🔗 Chain</b>
 /chain solana|bsc|base|eth|all
@@ -475,7 +603,6 @@ HELP_TEXT = """🤖 <b>Alpha Bot Commands</b>
 <b>🔄 Reset</b>
 /reset — reset all settings
 ━━━━━━━━━━━━━━━━━━━━"""
-
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 def handle_command(chat_id, text):
@@ -538,172 +665,146 @@ def handle_command(chat_id, text):
 
     elif cmd == "/maxalerts":
         if len(parts) < 2 or not parts[1].isdigit():
-            send_tg(chat_id, "Usage: /maxalerts [number]")
-            return
+            send_tg(chat_id, "Usage: /maxalerts [number]"); return
         settings["max_alerts_hr"] = int(parts[1])
         send_tg(chat_id, f"✅ Max alerts/hr: {settings['max_alerts_hr']}.")
 
     elif cmd == "/minbuys":
         if len(parts) < 2 or not parts[1].isdigit():
-            send_tg(chat_id, "Usage: /minbuys [number]")
-            return
+            send_tg(chat_id, "Usage: /minbuys [number]"); return
         settings["min_buys_5min"] = int(parts[1])
         send_tg(chat_id, f"✅ Min buys (5min): {settings['min_buys_5min']}.")
 
     elif cmd == "/minbonding":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /minbonding [%]")
-            return
+            send_tg(chat_id, "Usage: /minbonding [%]"); return
         settings["min_bonding_pct"] = float(parts[1])
         send_tg(chat_id, f"✅ Min bonding: {settings['min_bonding_pct']}%.")
 
     elif cmd == "/minliq":
         if len(parts) < 2 or not parts[1].isdigit():
-            send_tg(chat_id, "Usage: /minliq [amount]")
-            return
+            send_tg(chat_id, "Usage: /minliq [amount]"); return
         settings["min_liq"] = int(parts[1])
         send_tg(chat_id, f"✅ Min liq: ${settings['min_liq']:,}.")
 
     elif cmd == "/threshold":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /threshold [%]")
-            return
+            send_tg(chat_id, "Usage: /threshold [%]"); return
         settings["threshold"] = float(parts[1])
         send_tg(chat_id, f"✅ Threshold: {settings['threshold']}%.")
 
     elif cmd == "/minscore":
         if len(parts) < 2 or not parts[1].isdigit():
-            send_tg(chat_id, "Usage: /minscore [0-100]")
-            return
+            send_tg(chat_id, "Usage: /minscore [0-100]"); return
         settings["min_rug_score"] = int(parts[1])
         send_tg(chat_id, f"✅ Min rug score: {settings['min_rug_score']}/100.")
 
     elif cmd == "/safeonly":
-        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
-            send_tg(chat_id, "Usage: /safeonly on|off")
-            return
+        if len(parts) < 2 or parts[1].lower() not in ["on","off"]:
+            send_tg(chat_id, "Usage: /safeonly on|off"); return
         settings["safe_only"] = parts[1].lower() == "on"
         send_tg(chat_id, f"✅ Safe only: {'On' if settings['safe_only'] else 'Off'}.")
 
     elif cmd == "/charts":
-        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
-            send_tg(chat_id, "Usage: /charts on|off")
-            return
+        if len(parts) < 2 or parts[1].lower() not in ["on","off"]:
+            send_tg(chat_id, "Usage: /charts on|off"); return
         settings["charts"] = parts[1].lower() == "on"
         send_tg(chat_id, f"✅ Charts: {'On' if settings['charts'] else 'Off'}.")
 
     elif cmd == "/chain":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /chain [solana|bsc|base|eth|all]")
-            return
+            send_tg(chat_id, "Usage: /chain [solana|bsc|base|eth|all]"); return
         val = parts[1].lower()
-        chain_map = {
-            "solana": ["solana"], "bsc": ["bsc"],
-            "base": ["base"], "eth": ["ethereum"], "all": ALL_CHAINS[:]
-        }
+        chain_map = {"solana":["solana"],"bsc":["bsc"],"base":["base"],"eth":["ethereum"],"all":ALL_CHAINS[:]}
         if val not in chain_map:
-            send_tg(chat_id, "Options: solana, bsc, base, eth, all")
-            return
+            send_tg(chat_id, "Options: solana, bsc, base, eth, all"); return
         settings["chains"] = chain_map[val]
         send_tg(chat_id, f"✅ Scanning: {', '.join(settings['chains']).upper()}")
 
     elif cmd == "/wc":
-        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
-            send_tg(chat_id, "Usage: /wc on|off")
-            return
+        if len(parts) < 2 or parts[1].lower() not in ["on","off"]:
+            send_tg(chat_id, "Usage: /wc on|off"); return
         settings["wc_mode"] = parts[1].lower() == "on"
         send_tg(chat_id, f"✅ WC Scanner: {'On' if settings['wc_mode'] else 'Off'}.")
 
     elif cmd == "/gem":
-        if len(parts) < 2 or parts[1].lower() not in ["on", "off"]:
-            send_tg(chat_id, "Usage: /gem on|off")
-            return
+        if len(parts) < 2 or parts[1].lower() not in ["on","off"]:
+            send_tg(chat_id, "Usage: /gem on|off"); return
         settings["gem_mode"] = parts[1].lower() == "on"
         send_tg(chat_id, f"✅ Gem Hunter: {'On' if settings['gem_mode'] else 'Off'}.")
 
     elif cmd == "/mcap":
         if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
-            send_tg(chat_id, "Usage: /mcap [min] [max]")
-            return
+            send_tg(chat_id, "Usage: /mcap [min] [max]"); return
         settings["gem_mc_min"] = int(parts[1])
         settings["gem_mc_max"] = int(parts[2])
         send_tg(chat_id, f"✅ MC range: ${settings['gem_mc_min']:,} - ${settings['gem_mc_max']:,}.")
 
     elif cmd == "/reset":
         settings.update({
-            "max_alerts_hr": 13, "min_rug_score": 45,
-            "min_buys_5min": 10, "min_bonding_pct": 5.0,
-            "min_vol_usd": 2000, "buy_ratio_min": 0.60,
-            "min_liq": 3000, "chains": ALL_CHAINS[:],
-            "wc_mode": True, "gem_mode": True,
-            "gem_mc_min": 2000, "gem_mc_max": 30000,
-            "paused": False, "charts": True,
-            "safe_only": False, "threshold": 20,
-            "min_rug_score_wc": 30,
+            "max_alerts_hr":13,"min_rug_score":45,"min_buys_5min":10,
+            "min_bonding_pct":5.0,"min_vol_usd":2000,"buy_ratio_min":0.60,
+            "min_liq":3000,"chains":ALL_CHAINS[:],"wc_mode":True,"gem_mode":True,
+            "gem_mc_min":2000,"gem_mc_max":30000,"paused":False,"charts":True,
+            "safe_only":False,"threshold":20,"min_rug_score_wc":30,
         })
         send_tg(chat_id, "✅ All settings reset to default!")
 
     elif cmd == "/check":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /check [CA]")
-            return
+            send_tg(chat_id, "Usage: /check [CA]"); return
         send_tg(chat_id, "🔍 Checking token...")
         pair = dex_get(parts[1])
         if not pair:
-            send_tg(chat_id, "❌ Token not found.")
-            return
+            send_tg(chat_id, "❌ Token not found."); return
         base = pair.get("baseToken") or {}
-        wc   = is_wc_token(base.get("name", ""), base.get("symbol", ""))
+        wc   = is_wc_token(base.get("name",""), base.get("symbol",""))
         mc   = pair.get("marketCap") or pair.get("fdv") or 0
         gem  = settings["gem_mc_min"] <= mc <= settings["gem_mc_max"]
         act  = token_activity.get(parts[1])
         verdict, flags, score = rug_score(pair, gem_mode=gem, activity=act)
-        msg = format_alert(pair, "📋 Manual Check", verdict, flags, score, is_wc=wc, is_gem=gem, activity=act)
-        send_tg(chat_id, msg, chart_url(parts[1]))
+        card = build_card_data(pair, "📋 Manual Check", verdict, score, wc, gem)
+        send_tg(chat_id, format_alert(pair, "📋 Manual Check", verdict, flags, score, is_wc=wc, is_gem=gem, activity=act), card_data=card)
 
     elif cmd == "/watch":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /watch [CA]")
-            return
+            send_tg(chat_id, "Usage: /watch [CA]"); return
         watchlist.add(parts[1].lower())
         send_tg(chat_id, f"📌 Added! Watchlist: {len(watchlist)} tokens.")
 
     elif cmd == "/unwatch":
         if len(parts) < 2:
-            send_tg(chat_id, "Usage: /unwatch [CA]")
-            return
+            send_tg(chat_id, "Usage: /unwatch [CA]"); return
         watchlist.discard(parts[1].lower())
         send_tg(chat_id, "✅ Removed.")
 
     elif cmd == "/watchlist":
         if not watchlist:
-            send_tg(chat_id, "📌 Empty. Use /watch [CA].")
-            return
+            send_tg(chat_id, "📌 Empty. Use /watch [CA]."); return
         items = "\n".join([f"• <code>{ca}</code>" for ca in watchlist])
         send_tg(chat_id, f"📌 <b>Watchlist ({len(watchlist)})</b>\n{items}")
 
     elif cmd == "/top":
         send_tg(chat_id, "🔍 Fetching top WC tokens...")
         results = []
-        for kw in ["worldcup", "wc2026", "fifa", "mbappe", "messi"]:
+        for kw in ["worldcup","wc2026","fifa","mbappe","messi"]:
             for pair in dex_search(kw):
                 if pair.get("chainId") in settings["chains"]:
-                    vol = (pair.get("volume") or {}).get("h24", 0) or 0
-                    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+                    vol = (pair.get("volume") or {}).get("h24",0) or 0
+                    liq = (pair.get("liquidity") or {}).get("usd",0) or 0
                     if liq > 1000:
                         results.append((vol, pair))
         results.sort(key=lambda x: x[0], reverse=True)
         if not results:
-            send_tg(chat_id, "No WC tokens found.")
-            return
+            send_tg(chat_id, "No WC tokens found."); return
         msg = "🏆 <b>Top 5 WC Tokens (24h Vol)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         for i, (vol, pair) in enumerate(results[:5], 1):
             base = pair.get("baseToken") or {}
-            name = base.get("name", "?")
-            sym  = base.get("symbol", "?")
-            ch24 = (pair.get("priceChange") or {}).get("h24", 0) or 0
-            liq  = (pair.get("liquidity") or {}).get("usd", 0) or 0
-            url  = pair.get("url", "")
+            name = base.get("name","?")
+            sym  = base.get("symbol","?")
+            ch24 = (pair.get("priceChange") or {}).get("h24",0) or 0
+            liq  = (pair.get("liquidity") or {}).get("usd",0) or 0
+            url  = pair.get("url","")
             msg += f"{i}. <b>{name} (${sym})</b>\n   Vol: ${vol:,.0f} | Liq: ${liq:,.0f} | 24h: {ch24:+.1f}%\n   <a href=\"{url}\">Chart</a>\n\n"
         send_tg(chat_id, msg)
 
@@ -713,21 +814,20 @@ def handle_command(chat_id, text):
         for kw in list(WC_KEYWORDS)[:15]:
             for pair in dex_search(kw):
                 if pair.get("chainId") in settings["chains"]:
-                    ch1 = (pair.get("priceChange") or {}).get("h1", 0) or 0
-                    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+                    ch1 = (pair.get("priceChange") or {}).get("h1",0) or 0
+                    liq = (pair.get("liquidity") or {}).get("usd",0) or 0
                     if liq > 1000 and ch1 > 0:
                         results.append((ch1, pair))
         results.sort(key=lambda x: x[0], reverse=True)
         if not results:
-            send_tg(chat_id, "Nothing pumping right now.")
-            return
+            send_tg(chat_id, "Nothing pumping right now."); return
         msg = "🚀 <b>Trending (1h)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         for i, (ch1, pair) in enumerate(results[:5], 1):
             base = pair.get("baseToken") or {}
-            name = base.get("name", "?")
-            sym  = base.get("symbol", "?")
-            liq  = (pair.get("liquidity") or {}).get("usd", 0) or 0
-            url  = pair.get("url", "")
+            name = base.get("name","?")
+            sym  = base.get("symbol","?")
+            liq  = (pair.get("liquidity") or {}).get("usd",0) or 0
+            url  = pair.get("url","")
             wc   = "⚽" if is_wc_token(name, sym) else ""
             msg += f"{i}. {wc}<b>{name} (${sym})</b> +{ch1:.1f}%\n   Liq: ${liq:,.0f} | <a href=\"{url}\">Chart</a>\n\n"
         send_tg(chat_id, msg)
@@ -737,38 +837,32 @@ def handle_command(chat_id, text):
         found = 0
         now   = time.time()
         for mint, act in list(token_activity.items()):
-            if found >= 5:
-                break
+            if found >= 5: break
             age = now - act.get("first_seen", now)
-            if age > 1800:
-                continue
-            buys = act.get("buys", 0)
-            bc   = act.get("bonding_pct", 0)
-            if buys < 5 or bc < 3:
-                continue
+            if age > 1800: continue
+            buys = act.get("buys",0)
+            bc   = act.get("bonding_pct",0)
+            if buys < 5 or bc < 3: continue
             pair = dex_get(mint)
-            if not pair:
-                continue
+            if not pair: continue
             mc  = pair.get("marketCap") or pair.get("fdv") or 0
-            liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-            if liq < 500:
-                continue
-            wc      = is_wc_token(act.get("name", ""), act.get("symbol", ""))
+            liq = (pair.get("liquidity") or {}).get("usd",0) or 0
+            if liq < 500: continue
+            wc      = is_wc_token(act.get("name",""), act.get("symbol",""))
             gem     = settings["gem_mc_min"] <= mc <= settings["gem_mc_max"]
             verdict, flags, score = rug_score(pair, gem_mode=gem, activity=act)
             if score >= 35 and "RUG" not in verdict:
-                send_tg(chat_id, format_alert(pair, "💎 Manual Hunt", verdict, flags, score, is_wc=wc, is_gem=gem, activity=act), chart_url(mint))
+                card = build_card_data(pair, "💎 Manual Hunt", verdict, score, wc, gem)
+                send_tg(chat_id, format_alert(pair, "💎 Manual Hunt", verdict, flags, score, is_wc=wc, is_gem=gem, activity=act), card_data=card)
                 found += 1
                 time.sleep(3)
         if found == 0:
             send_tg(chat_id, "No fresh gems found. Try again in a few minutes!")
 
-
 # ── Poll Telegram Commands ────────────────────────────────────────────────────
 def poll_commands():
     global last_update_id
-    if not TELEGRAM_TOKEN:
-        return
+    if not TELEGRAM_TOKEN: return
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
@@ -779,33 +873,27 @@ def poll_commands():
         for update in updates:
             last_update_id = update["update_id"]
             msg     = update.get("message") or update.get("channel_post") or {}
-            text    = msg.get("text", "")
+            text    = msg.get("text","")
             chat_id = (msg.get("chat") or {}).get("id")
             if text.startswith("/") and chat_id:
                 handle_command(str(chat_id), text)
     except Exception as e:
         log.error(f"Poll error: {e}")
 
-
-# ── Process Token After Filters Pass ─────────────────────────────────────────
+# ── Process Token ─────────────────────────────────────────────────────────────
 def process_token(mint, activity):
     global total_alerts, total_gems
-    if not can_alert():
-        return
-    if settings["paused"]:
-        return
+    if not can_alert() or settings["paused"]: return
 
     pair = dex_get(mint)
-    if not pair:
-        return
+    if not pair: return
 
-    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-    if liq < settings["min_liq"]:
-        return
+    liq = (pair.get("liquidity") or {}).get("usd",0) or 0
+    if liq < settings["min_liq"]: return
 
     base    = pair.get("baseToken") or {}
-    name    = base.get("name", activity.get("name", ""))
-    symbol  = base.get("symbol", activity.get("symbol", ""))
+    name    = base.get("name", activity.get("name",""))
+    symbol  = base.get("symbol", activity.get("symbol",""))
     wc      = is_wc_token(name, symbol)
     mc      = pair.get("marketCap") or pair.get("fdv") or 0
     gem     = settings["gem_mc_min"] <= mc <= settings["gem_mc_max"]
@@ -813,11 +901,8 @@ def process_token(mint, activity):
     verdict, flags, score = rug_score(pair, gem_mode=gem, activity=activity)
 
     min_score = settings["min_rug_score_wc"] if wc else settings["min_rug_score"]
-
-    if score < min_score:
-        return
-    if settings["safe_only"] and "RUG" in verdict:
-        return
+    if score < min_score: return
+    if settings["safe_only"] and "RUG" in verdict: return
 
     if wc:
         trigger = "⚽ NEW WC TOKEN — Pump.fun Launch"
@@ -826,134 +911,103 @@ def process_token(mint, activity):
     else:
         trigger = "🆕 NEW TOKEN — Passed all filters"
 
+    card = build_card_data(pair, trigger, verdict, score, wc, gem)
     broadcast(
         format_alert(pair, trigger, verdict, flags, score, is_wc=wc, is_gem=gem, activity=activity),
-        chart_url(mint),
+        card_data=card,
     )
     record_alert()
     total_alerts += 1
-    if gem:
-        total_gems += 1
+    if gem: total_gems += 1
 
     seen[mint] = {"alerted_at": time.time()}
     log.info(f"Alerted: {name} ({symbol}) score={score} wc={wc} gem={gem}")
 
-
 # ── Pump.fun WebSocket ────────────────────────────────────────────────────────
 async def pumpfun_ws():
     uri = "wss://pumpdev.io/ws"
-    log.info("Connecting to Pump.fun WebSocket...")
+    log.info("Connecting to Pump.fun WebSocket…")
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
                 log.info("Connected to Pump.fun WebSocket!")
-
-                # Subscribe to new token launches and trades
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("Subscribed to new token launches")
 
                 async for raw in ws:
                     try:
-                        event = json.loads(raw)
-                        tx_type = event.get("txType", "")
-                        mint    = event.get("mint", "")
+                        event   = json.loads(raw)
+                        tx_type = event.get("txType","")
+                        mint    = event.get("mint","")
+                        if not mint: continue
 
-                        if not mint:
-                            continue
-
-                        # New token created
                         if tx_type == "create":
-                            name   = event.get("name", "")
-                            symbol = event.get("symbol", "")
-
-                            if is_stable(symbol):
-                                continue
-
-                            token_activity[mint]["name"]       = name
-                            token_activity[mint]["symbol"]     = symbol
-                            token_activity[mint]["mint"]       = mint
-                            token_activity[mint]["first_seen"] = time.time()
-                            token_activity[mint]["bonding_pct"] = float(event.get("vSolInBondingCurve", 0) or 0) / 85 * 100
-
-                            # Subscribe to this token's trades
-                            await ws.send(json.dumps({
-                                "method": "subscribeTokenTrade",
-                                "keys":   [mint],
-                            }))
-
+                            name   = event.get("name","")
+                            symbol = event.get("symbol","")
+                            if is_stable(symbol): continue
+                            token_activity[mint]["name"]        = name
+                            token_activity[mint]["symbol"]      = symbol
+                            token_activity[mint]["mint"]        = mint
+                            token_activity[mint]["first_seen"]  = time.time()
+                            token_activity[mint]["bonding_pct"] = float(event.get("vSolInBondingCurve",0) or 0) / 85 * 100
+                            await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":[mint]}))
                             log.info(f"New token: {name} ({symbol}) — {mint[:8]}...")
 
-                        # Trade event
-                        elif tx_type in ["buy", "sell"]:
+                        elif tx_type in ["buy","sell"]:
                             act     = token_activity[mint]
-                            trader  = event.get("traderPublicKey", "")
-                            creator = event.get("creatorPublicKey", "")
-                            sol_amt = float(event.get("solAmount", 0) or 0) / 1e9
+                            trader  = event.get("traderPublicKey","")
+                            creator = event.get("creatorPublicKey","")
+                            sol_amt = float(event.get("solAmount",0) or 0) / 1e9
 
                             if tx_type == "buy":
-                                act["buys"] += 1
+                                act["buys"]       += 1
                                 act["volume_sol"] += sol_amt
-                                if trader:
-                                    act["wallets"].add(trader)
+                                if trader: act["wallets"].add(trader)
                             else:
                                 act["sells"] += 1
-                                # Dev sold check
-                                if trader == creator:
-                                    act["dev_sold"] = True
+                                if trader == creator: act["dev_sold"] = True
 
-                            # Update bonding curve
-                            bc_sol = float(event.get("vSolInBondingCurve", 0) or 0)
-                            if bc_sol > 0:
-                                act["bonding_pct"] = bc_sol / 85 * 100
+                            bc_sol = float(event.get("vSolInBondingCurve",0) or 0)
+                            if bc_sol > 0: act["bonding_pct"] = bc_sol / 85 * 100
 
-                            # Check if this token passes filters
-                            age_min       = (time.time() - act["first_seen"]) / 60
-                            buys          = act["buys"]
-                            unique_w      = len(act["wallets"])
-                            vol_sol       = act["volume_sol"]
-                            bc_pct        = act["bonding_pct"]
-                            total_txns    = buys + act["sells"]
-                            buy_ratio     = buys / total_txns if total_txns > 0 else 0
-                            vol_usd_est   = vol_sol * 150  # rough SOL price estimate
+                            age_min     = (time.time() - act["first_seen"]) / 60
+                            buys        = act["buys"]
+                            unique_w    = len(act["wallets"])
+                            vol_sol     = act["volume_sol"]
+                            bc_pct      = act["bonding_pct"]
+                            total_txns  = buys + act["sells"]
+                            buy_ratio   = buys / total_txns if total_txns > 0 else 0
+                            vol_usd_est = vol_sol * 150
+                            wc_token    = is_wc_token(act["name"], act["symbol"])
 
-                            wc_token = is_wc_token(act["name"], act["symbol"])
-
-                            # WC tokens get easier filter
                             if wc_token and settings["wc_mode"]:
-                                passes = (
-                                    buys >= 5 and
-                                    not act["dev_sold"] and
-                                    buy_ratio >= 0.5 and
-                                    mint not in seen
-                                )
+                                passes = (buys >= 5 and not act["dev_sold"] and buy_ratio >= 0.5 and mint not in seen)
                             else:
                                 passes = (
-                                    unique_w >= settings["min_buys_5min"] and
-                                    bc_pct   >= settings["min_bonding_pct"] and
+                                    unique_w    >= settings["min_buys_5min"] and
+                                    bc_pct      >= settings["min_bonding_pct"] and
                                     not act["dev_sold"] and
-                                    buy_ratio >= settings["buy_ratio_min"] and
+                                    buy_ratio   >= settings["buy_ratio_min"] and
                                     vol_usd_est >= settings["min_vol_usd"] and
-                                    age_min <= 10 and
+                                    age_min     <= 10 and
                                     mint not in seen
                                 )
 
                             if passes and can_alert() and not settings["paused"]:
-                                # Run in thread to not block WebSocket
                                 loop = asyncio.get_event_loop()
                                 loop.run_in_executor(None, process_token, mint, dict(act))
 
                     except json.JSONDecodeError:
                         continue
                     except Exception as e:
-                        log.error(f"Event processing error: {e}")
+                        log.error(f"Event error: {e}")
 
         except Exception as e:
             log.error(f"WebSocket error: {e} — reconnecting in 5s...")
             await asyncio.sleep(5)
 
-
-# ── Command Polling Loop ──────────────────────────────────────────────────────
+# ── Command Loop ──────────────────────────────────────────────────────────────
 async def command_loop():
     while True:
         try:
@@ -962,30 +1016,27 @@ async def command_loop():
             log.error(f"Command loop error: {e}")
         await asyncio.sleep(3)
 
-
-# ── Cleanup Old Token Activity ────────────────────────────────────────────────
+# ── Cleanup Loop ──────────────────────────────────────────────────────────────
 async def cleanup_loop():
     while True:
         await asyncio.sleep(300)
-        now     = time.time()
-        to_del  = [m for m, a in token_activity.items() if now - a.get("first_seen", now) > 3600]
-        seen_del = [m for m, v in seen.items() if now - v.get("alerted_at", now) > 86400]
-        for m in to_del:
-            del token_activity[m]
-        for m in seen_del:
-            del seen[m]
+        now      = time.time()
+        to_del   = [m for m, a in token_activity.items() if now - a.get("first_seen",now) > 3600]
+        seen_del = [m for m, v in seen.items() if now - v.get("alerted_at",now) > 86400]
+        for m in to_del:   del token_activity[m]
+        for m in seen_del: del seen[m]
         if to_del or seen_del:
-            log.info(f"Cleaned up {len(to_del)} old tokens, {len(seen_del)} old seen entries")
-
+            log.info(f"Cleaned {len(to_del)} tokens, {len(seen_del)} seen entries")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("Alpha Bot v6 starting...")
+    log.info("Alpha Bot v6 + Cards starting…")
     broadcast(
         "🤖 <b>Alpha Bot v6 is LIVE!</b>\n"
         "🔌 Connected to Pump.fun WebSocket\n"
         "⚡ Real-time token detection from creation\n"
         "⚽ WC tokens + 💎 Gems + 🛡 Rug Score\n"
+        "🖼 Image cards enabled!\n"
         "Max 13 quality alerts per hour\n\n"
         "Send /help to see all commands 👇"
     )
@@ -994,7 +1045,6 @@ async def main():
         command_loop(),
         cleanup_loop(),
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())
