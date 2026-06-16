@@ -106,8 +106,7 @@ def is_stable(symbol):
     return symbol.upper() in {"USDT","USDC","BUSD","DAI","WETH","WBNB","WSOL","ETH","BNB","SOL","WBTC"}
 
 # ── Image Card Generator ──────────────────────────────────────────────────────
-BOLD_FONT = "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
-REG_FONT  = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+
 
 def _rounded_rect(draw, xy, radius, fill, outline=None, width=1):
     draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
@@ -132,10 +131,11 @@ def make_alert_card(data: dict) -> bytes:
     img  = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    f_huge = ImageFont.truetype(BOLD_FONT, 26)
-    f_big  = ImageFont.truetype(BOLD_FONT, 20)
-    f_med  = ImageFont.truetype(BOLD_FONT, 15)
-    f_tiny = ImageFont.truetype(REG_FONT,  11)
+f_huge = ImageFont.load_default(size=26)
+f_big  = ImageFont.load_default(size=20)
+f_med  = ImageFont.load_default(size=15)
+f_tiny = ImageFont.load_default(size=11)
+
 
     _rounded_rect(draw, [10,10,W-10,H-10], 12, CARD, BORDER, 1)
     _rounded_rect(draw, [10,10,W-10,58],   12, "#1a2332")
