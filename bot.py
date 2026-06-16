@@ -75,6 +75,14 @@ token_activity: dict = defaultdict(lambda: {
     "dev_sold": False, "bonding_pct": 0.0,
     "name": "", "symbol": "", "mint": "",
 })
+
+# ── Price Alert Targets ───────────────────────────────────────────────────────
+# { mint: {"target_pct": 50, "entry_price": 0.0001, "name": "TOKEN", "chat_id": "123"} }
+price_alerts: dict = {}
+
+# ── Recap Log ────────────────────────────────────────────────────────────────
+# Stores last 24h of alerts for /recap
+recap_log: list = []  # [ {time, name, symbol, trigger, score, verdict, price, url} ]
 # ── Rate Limiting ─────────────────────────────────────────────────────────────
 def can_alert():
     now = time.time()
@@ -427,6 +435,19 @@ def rug_score(pair, gem_mode=False, activity=None):
     if ch_h1 > 5 and ch_h6 > 10 and ch_h24 > 20 and liq > 5_000:
         greens.append("✅ Consistent growth 1h/6h/24h")
         safety += 10
+    # ── Whale concentration check (uses already-fetched pair data)
+    holders = (pair.get("info") or {}).get("holders") or []
+    if holders:
+        top10_pct = sum(float(h.get("percentage", 0)) for h in holders[:10])
+        if top10_pct > 80:
+            flags.append(f"🚨 Top 10 holders own {top10_pct:.0f}% — whale trap")
+            danger += 20
+        elif top10_pct > 60:
+            flags.append(f"⚠️ Top 10 holders own {top10_pct:.0f}%")
+            danger += 10
+        else:
+            greens.append(f"✅ Healthy distribution (top 10 own {top10_pct:.0f}%)")
+            safety += 10
     score = max(0, min(100, safety - danger + 30))
     if danger >= 45 or (danger >= 25 and safety < 15):
         verdict = "🚨 LIKELY RUG"
@@ -523,6 +544,12 @@ HELP_TEXT = """🤖 <b>Alpha Bot Commands</b>
 /top — top WC tokens
 /trending — hottest pumps
 /findbetter — find gems now
+<b>🎯 Price Alerts</b>
+/alert [CA] [%] — alert when token pumps X%
+/alerts — view your active price alerts
+/cancelalert [CA] — remove a price alert
+<b>📋 Recap</b>
+/recap — last 24h alert summary
 <b>📌 Watchlist</b>
 /watch [CA]
 /unwatch [CA]
@@ -759,6 +786,73 @@ def handle_command(chat_id, text):
                 time.sleep(3)
         if found == 0:
             send_tg(chat_id, "No fresh gems found. Try again in a few minutes!")
+    elif cmd == "/alert":
+        if len(parts) < 3:
+            send_tg(chat_id, "Usage: /alert [CA] [target %]\nExample: /alert ABC123 50"); return
+        mint = parts[1]
+        try:
+            target = float(parts[2])
+        except:
+            send_tg(chat_id, "Invalid % — example: /alert ABC123 50"); return
+        send_tg(chat_id, "🔍 Fetching token price...")
+        pair = dex_get(mint)
+        if not pair:
+            send_tg(chat_id, "❌ Token not found."); return
+        entry = float(pair.get("priceUsd") or 0)
+        if entry <= 0:
+            send_tg(chat_id, "❌ Could not get price."); return
+        name = (pair.get("baseToken") or {}).get("name", mint[:8])
+        sym  = (pair.get("baseToken") or {}).get("symbol", "?")
+        price_alerts[mint] = {
+            "target_pct":  target,
+            "entry_price": entry,
+            "name":        name,
+            "symbol":      sym,
+            "chat_id":     chat_id,
+            "url":         pair.get("url",""),
+            "set_at":      time.time(),
+        }
+        send_tg(chat_id, f"🎯 Alert set!\n<b>{name} (${sym})</b>\nEntry: ${entry}\nTarget: +{target}% = ${entry * (1 + target/100):.8f}\nI'll ping you when it hits! 🔔")
+    elif cmd == "/alerts":
+        if not price_alerts:
+            send_tg(chat_id, "No active price alerts. Use /alert [CA] [%]"); return
+        msg = "🎯 <b>Active Price Alerts</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        for mint, a in price_alerts.items():
+            pair    = dex_get(mint)
+            cur     = float((pair or {}).get("priceUsd") or 0)
+            pct_now = ((cur - a["entry_price"]) / a["entry_price"] * 100) if a["entry_price"] > 0 else 0
+            msg += f"• <b>{a['name']} (${a['symbol']})</b>\n  Target: +{a['target_pct']}% | Now: {pct_now:+.1f}%\n  <code>{mint[:16]}...</code>\n\n"
+        send_tg(chat_id, msg)
+    elif cmd == "/cancelalert":
+        if len(parts) < 2:
+            send_tg(chat_id, "Usage: /cancelalert [CA]"); return
+        if parts[1] in price_alerts:
+            name = price_alerts[parts[1]]["name"]
+            del price_alerts[parts[1]]
+            send_tg(chat_id, f"✅ Alert removed for {name}.")
+        else:
+            send_tg(chat_id, "❌ No alert found for that CA.")
+    elif cmd == "/recap":
+        now = time.time()
+        recent = [r for r in recap_log if now - r["time"] <= 86400]
+        if not recent:
+            send_tg(chat_id, "📋 No alerts in the last 24h yet."); return
+        wc_count  = sum(1 for r in recent if r.get("is_wc"))
+        gem_count = sum(1 for r in recent if r.get("is_gem"))
+        avg_score = sum(r["score"] for r in recent) / len(recent)
+        msg = f"""📋 <b>Last 24h Recap</b>
+━━━━━━━━━━━━━━━━━━━━
+📢 Total alerts: {len(recent)}
+⚽ WC tokens: {wc_count}
+💎 Gems: {gem_count}
+🛡 Avg safety score: {avg_score:.0f}/100
+━━━━━━━━━━━━━━━━━━━━\n"""
+        for r in recent[-10:]:  # last 10
+            t   = datetime.fromtimestamp(r["time"], tz=timezone.utc).strftime("%H:%M")
+            msg += f"[{t}] <b>{r['name']} (${r['symbol']})</b> — {r['verdict']} {r['score']}/100\n"
+        if len(recent) > 10:
+            msg += f"\n...and {len(recent)-10} more"
+        send_tg(chat_id, msg)
 # ── Poll Telegram Commands ────────────────────────────────────────────────────
 def poll_commands():
     global last_update_id
@@ -812,8 +906,51 @@ def process_token(mint, activity):
     total_alerts += 1
     if gem: total_gems += 1
     seen[mint] = {"alerted_at": time.time()}
+    # Log to recap
+    recap_log.append({
+        "time":    time.time(),
+        "name":    name,
+        "symbol":  symbol,
+        "trigger": trigger,
+        "score":   score,
+        "verdict": verdict,
+        "is_wc":   wc,
+        "is_gem":  gem,
+        "url":     pair.get("url",""),
+    })
+    # Keep only last 24h
+    cutoff = time.time() - 86400
+    while recap_log and recap_log[0]["time"] < cutoff:
+        recap_log.pop(0)
     log.info(f"Alerted: {name} ({symbol}) score={score} wc={wc} gem={gem}")
-# ── Pump.fun WebSocket ────────────────────────────────────────────────────────
+# ── Price Alert Checker ───────────────────────────────────────────────────────
+async def price_alert_loop():
+    while True:
+        await asyncio.sleep(60)  # check every minute
+        if not price_alerts: continue
+        to_remove = []
+        for mint, a in list(price_alerts.items()):
+            try:
+                pair = dex_get(mint)
+                if not pair: continue
+                cur = float(pair.get("priceUsd") or 0)
+                if cur <= 0: continue
+                pct = (cur - a["entry_price"]) / a["entry_price"] * 100
+                if pct >= a["target_pct"]:
+                    send_tg(a["chat_id"], f"""🎯 <b>PRICE ALERT HIT!</b>
+━━━━━━━━━━━━━━━━━━━━
+🪙 <b>{a['name']} (${a['symbol']})</b>
+📈 Target: +{a['target_pct']}%
+✅ Actual: +{pct:.1f}%
+💰 Price now: ${cur}
+🔍 <a href="{a['url']}">DEXScreener</a>
+━━━━━━━━━━━━━━━━━━━━""")
+                    to_remove.append(mint)
+                    log.info(f"Price alert hit: {a['name']} +{pct:.1f}%")
+            except Exception as e:
+                log.error(f"Price alert check error: {e}")
+        for mint in to_remove:
+            price_alerts.pop(mint, None)
 async def pumpfun_ws():
     uri = "wss://pumpdev.io/ws"
     log.info("Connecting to Pump.fun WebSocket…")
@@ -920,6 +1057,7 @@ async def main():
         pumpfun_ws(),
         command_loop(),
         cleanup_loop(),
+        price_alert_loop(),
     )
 if __name__ == "__main__":
     asyncio.run(main())
