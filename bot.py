@@ -1308,10 +1308,10 @@ async def price_alert_loop():
 
 # ── DEXScreener Fallback Scanner (runs if WebSocket dies) ────────────────────
 async def dexscreener_fallback():
-    """Scan DEXScreener every 60s as a fallback when WebSocket is down."""
+    """Scan DEXScreener every 30s as a fallback when WebSocket is down."""
     log.info("DEXScreener fallback scanner started")
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         if settings["paused"]: continue
         try:
             checked = set()
@@ -1350,21 +1350,19 @@ async def dexscreener_fallback():
             log.error(f"DEXScreener fallback error: {e}")
 
 # ── Pump.fun WebSocket ────────────────────────────────────────────────────────
-WS_URLS = [
-    "wss://pumpportal.fun/api/data",  # primary — most reliable
-    "wss://pumpdev.io/ws",            # fallback
-]
+WS_URL = "wss://pumpportal.fun/api/data"  # confirmed working — pumpdev.io was dead weight
 
 async def pumpfun_ws():
     log.info("Connecting to Pump.fun WebSocket...")
-    url_index = 0
+    retry_count = 0
     while True:
-        uri = WS_URLS[url_index % len(WS_URLS)]
-        log.info(f"Trying WebSocket: {uri}")
+        log.info(f"Trying WebSocket: {WS_URL} (attempt {retry_count+1})")
         try:
-            async with websockets.connect(uri,ping_interval=20,ping_timeout=10) as ws:
-                log.info(f"Connected to {uri}!")
-                broadcast(f"🔌 WebSocket connected: <code>{uri}</code>")
+            async with websockets.connect(WS_URL,ping_interval=20,ping_timeout=10) as ws:
+                log.info(f"Connected to {WS_URL}!")
+                if retry_count > 0:
+                    broadcast(f"🔌 WebSocket reconnected after {retry_count} retries")
+                retry_count = 0
                 await ws.send(json.dumps({"method":"subscribeNewToken"}))
                 async for raw in ws:
                     try:
@@ -1426,9 +1424,12 @@ async def pumpfun_ws():
                     except json.JSONDecodeError: continue
                     except Exception as e: log.error(f"Event error: {e}")
         except Exception as e:
-            log.error(f"WS error on {uri}: {e} — trying next URL in 5s...")
-            url_index += 1
-            await asyncio.sleep(5)
+            retry_count += 1
+            wait = min(5 * retry_count, 30)  # backoff up to 30s max
+            log.error(f"WS error: {e} — retry #{retry_count} in {wait}s...")
+            if retry_count in (3, 10, 20):  # alert you if it's struggling
+                broadcast(f"⚠️ WebSocket reconnecting (attempt {retry_count})... DEXScreener fallback is still scanning.")
+            await asyncio.sleep(wait)
 
 # ── Process Token ─────────────────────────────────────────────────────────────
 def process_token(mint,activity):
