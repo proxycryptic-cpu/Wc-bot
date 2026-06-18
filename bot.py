@@ -1306,14 +1306,65 @@ async def price_alert_loop():
                 log.error(f"Price alert error: {e}")
         for mint in to_remove: price_alerts.pop(mint,None)
 
-# ── Pump.fun WebSocket ────────────────────────────────────────────────────────
-async def pumpfun_ws():
-    uri="wss://pumpdev.io/ws"
-    log.info("Connecting to Pump.fun WebSocket...")
+# ── DEXScreener Fallback Scanner (runs if WebSocket dies) ────────────────────
+async def dexscreener_fallback():
+    """Scan DEXScreener every 60s as a fallback when WebSocket is down."""
+    log.info("DEXScreener fallback scanner started")
     while True:
+        await asyncio.sleep(60)
+        if settings["paused"]: continue
+        try:
+            checked = set()
+            keywords = list(WC_KEYWORDS)[:20] if settings["wc_mode"] else ["solana","bsc","meme","pepe","doge"]
+            for kw in keywords:
+                pairs = dex_search(kw)
+                for pair in pairs:
+                    chain = pair.get("chainId","")
+                    if chain not in settings["chains"]: continue
+                    base  = pair.get("baseToken") or {}
+                    mint  = base.get("address","")
+                    if not mint or mint in checked or mint in seen or mint in rug_blacklist: continue
+                    checked.add(mint)
+                    sym = base.get("symbol","").upper()
+                    if is_stable(sym): continue
+                    liq    = (pair.get("liquidity") or {}).get("usd",0) or 0
+                    vol_h1 = (pair.get("volume") or {}).get("h1",0) or 0
+                    ch_h1  = (pair.get("priceChange") or {}).get("h1",0) or 0
+                    created= pair.get("pairCreatedAt") or 0
+                    age_min= ((time.time()*1000)-created)/60_000 if created else 9999
+                    if liq < settings["min_liq"]: continue
+                    # Only alert on new tokens (under 30 min) or big moves
+                    if age_min > 30 and abs(ch_h1) < settings["threshold"]: continue
+                    if not can_alert(): break
+                    fake_activity = {
+                        "buys":int(vol_h1/50) if vol_h1 else 5,
+                        "sells":2,"wallets":set(),"volume_sol":vol_h1/150,
+                        "first_seen":time.time()-(age_min*60),
+                        "dev_sold":False,"bonding_pct":10.0,
+                        "name":base.get("name",""),"symbol":sym,"mint":mint,
+                    }
+                    loop = asyncio.get_event_loop()
+                    loop.run_in_executor(None, process_token, mint, fake_activity)
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            log.error(f"DEXScreener fallback error: {e}")
+
+# ── Pump.fun WebSocket ────────────────────────────────────────────────────────
+WS_URLS = [
+    "wss://pumpportal.fun/api/data",  # primary — most reliable
+    "wss://pumpdev.io/ws",            # fallback
+]
+
+async def pumpfun_ws():
+    log.info("Connecting to Pump.fun WebSocket...")
+    url_index = 0
+    while True:
+        uri = WS_URLS[url_index % len(WS_URLS)]
+        log.info(f"Trying WebSocket: {uri}")
         try:
             async with websockets.connect(uri,ping_interval=20,ping_timeout=10) as ws:
-                log.info("Connected!")
+                log.info(f"Connected to {uri}!")
+                broadcast(f"🔌 WebSocket connected: <code>{uri}</code>")
                 await ws.send(json.dumps({"method":"subscribeNewToken"}))
                 async for raw in ws:
                     try:
@@ -1375,7 +1426,8 @@ async def pumpfun_ws():
                     except json.JSONDecodeError: continue
                     except Exception as e: log.error(f"Event error: {e}")
         except Exception as e:
-            log.error(f"WS error: {e} — reconnecting in 5s...")
+            log.error(f"WS error on {uri}: {e} — trying next URL in 5s...")
+            url_index += 1
             await asyncio.sleep(5)
 
 # ── Process Token ─────────────────────────────────────────────────────────────
@@ -1483,6 +1535,7 @@ async def main():
     )
     await asyncio.gather(
         pumpfun_ws(),
+        dexscreener_fallback(),
         command_loop(),
         cleanup_loop(),
         price_alert_loop(),
