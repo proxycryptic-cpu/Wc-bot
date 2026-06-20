@@ -14,6 +14,7 @@ from collections import deque, defaultdict
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SOL_PRIVATE_KEY  = os.environ.get("SOL_PRIVATE_KEY", "")   # base58 Solana private key
+PUMPPORTAL_API_KEY = os.environ.get("PUMPPORTAL_API_KEY", "")  # needed for trade data
 BSC_PRIVATE_KEY  = os.environ.get("BSC_PRIVATE_KEY", "")   # hex BSC private key
 BSC_RPC          = os.environ.get("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOL_RPC          = os.environ.get("SOL_RPC", "https://api.mainnet-beta.solana.com")
@@ -1187,6 +1188,7 @@ def handle_command(chat_id, text):
         tokens_with_buys=sum(1 for a in token_activity.values() if a.get("buys",0)>0)
         send_tg(chat_id,f"""🔧 <b>Debug Diagnostics</b>
 ━━━━━━━━━━━━━━━━━━━━
+🔑 API key: {'✅ Loaded' if PUMPPORTAL_API_KEY else '❌ Missing'}
 🔌 WS connected for: {connected_secs}s
 📨 Total events: {ws_events_received}
 🆕 'create' events: {ws_creates_received}
@@ -1375,7 +1377,7 @@ async def dexscreener_fallback():
             log.error(f"DEXScreener fallback error: {e}")
 
 # ── Pump.fun WebSocket ────────────────────────────────────────────────────────
-WS_URL = "wss://pumpportal.fun/api/data"  # confirmed working — pumpdev.io was dead weight
+WS_URL = f"wss://pumpportal.fun/api/data?api-key={PUMPPORTAL_API_KEY}" if PUMPPORTAL_API_KEY else "wss://pumpportal.fun/api/data"
 
 async def pumpfun_ws():
     global ws_events_received, ws_creates_received, ws_trades_received, ws_connected_since, last_event_time
@@ -1559,9 +1561,12 @@ All-time PnL: {'+' if sum(t['pnl_usd'] for t in trade_history)>=0 else ''}${sum(
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     log.info("Alpha Bot v7 starting...")
+    key_status = "✅ PumpPortal API key loaded — trade data enabled" if PUMPPORTAL_API_KEY else "⚠️ No PumpPortal API key — trade events may not work!"
+    log.info(key_status)
     broadcast(
         "🤖 <b>Alpha Bot v7 is LIVE!</b>\n"
         "🔌 Pump.fun WebSocket connected\n"
+        f"{key_status}\n"
         "⚡ Real-time token detection\n"
         "⚽ WC tokens + 💎 Gems + 🛡 Rug Score\n"
         "🖼 Image cards ON\n"
