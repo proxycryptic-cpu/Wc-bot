@@ -84,6 +84,11 @@ start_time = time.time()
 total_alerts = 0
 total_gems = 0
 total_scans = 0
+ws_events_received = 0
+ws_creates_received = 0
+ws_trades_received = 0
+ws_connected_since = 0
+last_event_time = 0
 alert_times = deque()
 last_tg_send = 0
 token_activity: dict = defaultdict(lambda: {
@@ -811,6 +816,7 @@ HELP_TEXT = """🤖 <b>Alpha Bot v7 Commands</b>
 <b>📋 Recap</b>
 /recap — last 24h summary
 /pnl — all-time PnL summary
+/debug — raw WebSocket diagnostics
 
 <b>📌 Watchlist</b>
 /watch [CA]
@@ -1173,6 +1179,25 @@ def handle_command(chat_id, text):
         if not whale_wallets: send_tg(chat_id,"🐋 No whale wallets tracked. Use /addwhale [wallet]"); return
         send_tg(chat_id,"🐋 <b>Tracked Whales</b>\n"+"".join([f"• <code>{w}</code>\n" for w in whale_wallets]))
 
+    elif cmd=="/debug":
+        now=time.time()
+        connected_secs=int(now-ws_connected_since) if ws_connected_since else 0
+        since_last=int(now-last_event_time) if last_event_time else -1
+        active_tokens=len(token_activity)
+        tokens_with_buys=sum(1 for a in token_activity.values() if a.get("buys",0)>0)
+        send_tg(chat_id,f"""🔧 <b>Debug Diagnostics</b>
+━━━━━━━━━━━━━━━━━━━━
+🔌 WS connected for: {connected_secs}s
+📨 Total events: {ws_events_received}
+🆕 'create' events: {ws_creates_received}
+💱 'buy'/'sell' events: {ws_trades_received}
+⏱ Last event: {since_last}s ago
+📦 Tokens tracked: {active_tokens}
+📈 Tokens w/ buys: {tokens_with_buys}
+🔍 Last scan: {total_scans}
+━━━━━━━━━━━━━━━━━━━━
+{'⚠️ No events in 60s+ — WS may be silently stalled' if since_last>60 else '✅ Receiving data normally'}""")
+
     else:
         send_tg(chat_id,"❓ Unknown command. Send /help")
 
@@ -1353,23 +1378,30 @@ async def dexscreener_fallback():
 WS_URL = "wss://pumpportal.fun/api/data"  # confirmed working — pumpdev.io was dead weight
 
 async def pumpfun_ws():
+    global ws_events_received, ws_creates_received, ws_trades_received, ws_connected_since, last_event_time
     log.info("Connecting to Pump.fun WebSocket...")
     retry_count = 0
+    subscribed_mints = []  # FIX: accumulate all mints, don't replace on each new token
     while True:
         log.info(f"Trying WebSocket: {WS_URL} (attempt {retry_count+1})")
         try:
             async with websockets.connect(WS_URL,ping_interval=20,ping_timeout=10) as ws:
                 log.info(f"Connected to {WS_URL}!")
+                ws_connected_since = time.time()
                 if retry_count > 0:
                     broadcast(f"🔌 WebSocket reconnected after {retry_count} retries")
                 retry_count = 0
+                subscribed_mints = []  # reset on reconnect, will re-subscribe as creates come in
                 await ws.send(json.dumps({"method":"subscribeNewToken"}))
                 async for raw in ws:
                     try:
+                        ws_events_received += 1
+                        last_event_time = time.time()
                         event=json.loads(raw)
                         tx_type=event.get("txType",""); mint=event.get("mint","")
                         if not mint: continue
                         if tx_type=="create":
+                            ws_creates_received += 1
                             name=event.get("name",""); symbol=event.get("symbol","")
                             if is_stable(symbol): continue
                             token_activity[mint]["name"]=name
@@ -1377,8 +1409,13 @@ async def pumpfun_ws():
                             token_activity[mint]["mint"]=mint
                             token_activity[mint]["first_seen"]=time.time()
                             token_activity[mint]["bonding_pct"]=float(event.get("vSolInBondingCurve",0) or 0)/85*100
-                            await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":[mint]}))
+                            # FIX: accumulate mints, send full list so old subscriptions aren't dropped
+                            subscribed_mints.append(mint)
+                            if len(subscribed_mints) > 200:  # cap to avoid unbounded growth
+                                subscribed_mints = subscribed_mints[-200:]
+                            await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":subscribed_mints}))
                         elif tx_type in ["buy","sell"]:
+                            ws_trades_received += 1
                             act=token_activity[mint]
                             trader=event.get("traderPublicKey","")
                             creator=event.get("creatorPublicKey","")
