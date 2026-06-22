@@ -13,6 +13,7 @@ from collections import deque, defaultdict
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+ADMIN_USER_IDS = set(filter(None, os.environ.get("ADMIN_USER_IDS", "").split(",")))  # comma-separated Telegram user IDs
 SOL_PRIVATE_KEY  = os.environ.get("SOL_PRIVATE_KEY", "")   # base58 Solana private key
 PUMPPORTAL_API_KEY = os.environ.get("PUMPPORTAL_API_KEY", "")  # needed for trade data
 BSC_PRIVATE_KEY  = os.environ.get("BSC_PRIVATE_KEY", "")   # hex BSC private key
@@ -828,9 +829,28 @@ HELP_TEXT = """🤖 <b>Alpha Bot v7 Commands</b>
 /reset — reset all settings
 ━━━━━━━━━━━━━━━━━━━━"""
 
+# ── Admin Permission System ───────────────────────────────────────────────────
+ADMIN_ONLY_COMMANDS = {
+    "/pause","/resume","/maxalerts","/minbuys","/minbonding","/minliq","/threshold",
+    "/minscore","/safeonly","/charts","/chain","/wc","/gem","/mcap","/reset",
+    "/buy","/sell","/autobuy","/tradesize","/tp","/sl","/blacklist",
+    "/addwhale","/removewhale","/addadmin","/removeadmin",
+}
+
+def is_admin(user_id: str) -> bool:
+    # Bot owner (TELEGRAM_CHAT_ID as a DM) is always admin, plus anyone in ADMIN_USER_IDS
+    if not ADMIN_USER_IDS:  # if no admins configured yet, only the original chat is trusted
+        return True
+    return str(user_id) in ADMIN_USER_IDS
+
 # ── Commands ──────────────────────────────────────────────────────────────────
-def handle_command(chat_id, text):
+def handle_command(chat_id, text, user_id=None):
     text=text.strip(); parts=text.split(); cmd=parts[0].lower().split("@")[0]
+    uid = user_id or chat_id
+
+    if cmd in ADMIN_ONLY_COMMANDS and not is_admin(uid):
+        send_tg(chat_id, "🔒 This command is admin-only. Ask a bot admin to run it.")
+        return
 
     # ── v6 commands (all kept) ────────────────────────────────────────────────
     if cmd in ["/start","/help"]:
@@ -1180,6 +1200,25 @@ def handle_command(chat_id, text):
         if not whale_wallets: send_tg(chat_id,"🐋 No whale wallets tracked. Use /addwhale [wallet]"); return
         send_tg(chat_id,"🐋 <b>Tracked Whales</b>\n"+"".join([f"• <code>{w}</code>\n" for w in whale_wallets]))
 
+    elif cmd=="/addadmin":
+        if len(parts)<2: send_tg(chat_id,"Usage: /addadmin [telegram_user_id]\nForward a message from them or ask for their ID via @userinfobot"); return
+        ADMIN_USER_IDS.add(parts[1])
+        send_tg(chat_id,f"✅ Added admin: {parts[1]}\n⚠️ Note: this resets if the bot restarts — for permanent admins, add their ID to the ADMIN_USER_IDS Railway variable (comma-separated).")
+
+    elif cmd=="/removeadmin":
+        if len(parts)<2: send_tg(chat_id,"Usage: /removeadmin [telegram_user_id]"); return
+        ADMIN_USER_IDS.discard(parts[1])
+        send_tg(chat_id,f"✅ Removed admin: {parts[1]}")
+
+    elif cmd=="/admins":
+        if not ADMIN_USER_IDS:
+            send_tg(chat_id,"👑 No admins configured — currently EVERYONE has full access (including trading commands).\nUse /addadmin [id] to lock it down.")
+        else:
+            send_tg(chat_id,"👑 <b>Bot Admins</b>\n"+"".join([f"• <code>{a}</code>\n" for a in ADMIN_USER_IDS])+"\nEveryone else can only view alerts and use info commands.")
+
+    elif cmd=="/myid":
+        send_tg(chat_id,f"🆔 Your Telegram user ID: <code>{user_id or chat_id}</code>\nGive this to a bot admin to get admin access.")
+
     elif cmd=="/debug":
         now=time.time()
         connected_secs=int(now-ws_connected_since) if ws_connected_since else 0
@@ -1342,7 +1381,7 @@ async def dexscreener_fallback():
         if settings["paused"]: continue
         try:
             checked = set()
-            keywords = list(WC_KEYWORDS)[:20] if settings["wc_mode"] else ["solana","bsc","meme","pepe","doge"]
+            keywords = list(WC_KEYWORDS)[:20] + ["solana","bsc","meme","pepe","doge","new","launch"]
             for kw in keywords:
                 pairs = dex_search(kw)
                 for pair in pairs:
@@ -1442,21 +1481,17 @@ async def pumpfun_ws():
                             buy_ratio=buys/total_txns if total_txns>0 else 0
                             vol_usd_est=vol_sol*150
                             wc_token=is_wc_token(act["name"],act["symbol"])
-                            # ── FIXED FILTERS: WC tokens easier, non-WC also realistic
-                            if wc_token and settings["wc_mode"]:
-                                passes=(buys>=5 and not act["dev_sold"] and buy_ratio>=0.5 and mint not in seen and mint not in rug_blacklist)
-                            else:
-                                # FIXED: much more lenient so non-WC tokens show up
-                                passes=(
-                                    unique_w>=settings["min_buys_5min"] and      # 5 (was 10)
-                                    bc_pct>=settings["min_bonding_pct"] and       # 3% (was 5%)
-                                    not act["dev_sold"] and
-                                    buy_ratio>=settings["buy_ratio_min"] and      # 0.55 (was 0.60)
-                                    vol_usd_est>=settings["min_vol_usd"] and      # $500 (was $2000)
-                                    age_min<=15 and                                # 15min (was 10)
-                                    mint not in seen and
-                                    mint not in rug_blacklist
-                                )
+                            # ── EQUAL FILTERS: same bar for WC and non-WC tokens
+                            passes=(
+                                unique_w>=settings["min_buys_5min"] and
+                                bc_pct>=settings["min_bonding_pct"] and
+                                not act["dev_sold"] and
+                                buy_ratio>=settings["buy_ratio_min"] and
+                                vol_usd_est>=settings["min_vol_usd"] and
+                                age_min<=15 and
+                                mint not in seen and
+                                mint not in rug_blacklist
+                            )
                             if passes and can_alert() and not settings["paused"]:
                                 loop=asyncio.get_event_loop()
                                 loop.run_in_executor(None,process_token,mint,dict(act))
@@ -1486,7 +1521,7 @@ def process_token(mint,activity):
     mc=pair.get("marketCap") or pair.get("fdv") or 0
     gem=settings["gem_mc_min"]<=mc<=settings["gem_mc_max"]
     verdict,flags,score=rug_score(pair,gem_mode=gem,activity=activity)
-    min_score=settings["min_rug_score_wc"] if wc else settings["min_rug_score"]
+    min_score=settings["min_rug_score"]  # EQUAL: same threshold for WC and non-WC
     if score<min_score: return
     if settings["safe_only"] and "RUG" in verdict: return
     if wc:   trigger="⚽ NEW WC TOKEN — Pump.fun Launch"
