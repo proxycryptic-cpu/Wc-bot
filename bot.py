@@ -5,7 +5,7 @@ import time
 import io
 import requests
 import logging
-import websockets
+import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timezone
 from collections import deque, defaultdict
@@ -14,31 +14,29 @@ from collections import deque, defaultdict
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ADMIN_USER_IDS = set(filter(None, os.environ.get("ADMIN_USER_IDS", "").split(",")))  # comma-separated Telegram user IDs
-SOL_PRIVATE_KEY  = os.environ.get("SOL_PRIVATE_KEY", "")   # base58 Solana private key
-PUMPPORTAL_API_KEY = os.environ.get("PUMPPORTAL_API_KEY", "")  # needed for trade data
+SOL_PRIVATE_KEY  = os.environ.get("SOL_PRIVATE_KEY", "")   # base58 Solana private key — only needed for actual trading via /buy or auto-buy
+PUMPPORTAL_API_KEY = os.environ.get("PUMPPORTAL_API_KEY", "")  # NOT required anymore — scanner is DEXScreener-only now
 BSC_PRIVATE_KEY  = os.environ.get("BSC_PRIVATE_KEY", "")   # hex BSC private key
 BSC_RPC          = os.environ.get("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOL_RPC          = os.environ.get("SOL_RPC", "https://api.mainnet-beta.solana.com")
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 settings = {
-    "max_alerts_hr":    13,
-    "min_rug_score":    35,        # FIXED: lowered from 45 so more tokens pass
-    "min_buys_5min":    5,         # FIXED: lowered from 10
-    "min_bonding_pct":  3.0,       # FIXED: lowered from 5.0
-    "min_vol_usd":      500,       # FIXED: lowered from 2000
-    "buy_ratio_min":    0.55,      # FIXED: lowered from 0.60
-    "min_liq":          1000,      # FIXED: lowered from 3000
+    "max_alerts_hr":    6,         # ANTI-SPAM: fewer, higher-quality alerts per hour
+    "min_rug_score":    45,        # ANTI-SPAM: raised — only solid coins pass
+    "min_buys_5min":    5,
+    "min_bonding_pct":  3.0,
+    "min_vol_usd":      2000,      # ANTI-SPAM: raised — needs real volume, not dust
+    "buy_ratio_min":    0.60,      # ANTI-SPAM: needs more genuine buy pressure
+    "min_liq":          5000,      # ANTI-SPAM: raised — skip ultra-low-liq dust tokens
     "chains":           ["solana", "bsc", "base", "ethereum"],
-    "wc_mode":          True,
     "gem_mode":         True,
     "gem_mc_min":       2000,
-    "gem_mc_max":       50000,     # FIXED: raised from 30000
+    "gem_mc_max":       50000,
     "paused":           False,
     "charts":           True,
     "safe_only":        False,
-    "threshold":        20,
-    "min_rug_score_wc": 25,        # FIXED: lowered from 30
+    "threshold":        30,        # ANTI-SPAM: needs a bigger move to count as "pumping"
     "auto_buy":         False,     # auto buy without confirmation
     "max_trade_usd":    5.0,       # max $5 per trade
     "take_profit_pct":  100.0,     # sell half at 2x
@@ -49,30 +47,25 @@ settings = {
 
 ALL_CHAINS = ["solana", "bsc", "base", "ethereum"]
 
-WC_KEYWORDS = set([
-    "worldcup","world cup","wc2026","worldcup2026","fifa2026",
-    "fifa","fwc","fwc26","fifawc","fifameme","fifacoin",
-    "footballcoin","soccercoin","goatcoin","championsleague",
-    "goldenboot","hatrick","penalty","freekick","worldgoal",
-    "usmnt","uswnt","usasoccer","mexicofifa","canadafc",
-    "losangeles","miami","dallas","seattle","houston",
-    "philadelphia","atlanta","toronto","vancouver","guadalajara",
-    "england","threelions","france","germany","mannschaft",
-    "spain","lafuria","portugal","selecao","netherlands",
-    "croatia","belgium","switzerland","scotland","norway",
-    "sweden","turkey","turkiye","czechia","bosnia","argentina",
-    "albiceleste","brazil","canarinho","colombia","uruguay",
-    "ecuador","paraguay","morocco","algeria","egypt",
-    "ghana","tunisia","japan","samuraiblue","southkorea",
-    "australia","iran","jordan","uzbekistan","panama",
-    "curacao","haiti","newzealand","capeverde",
-    "ronaldo","cr7","messi","mbappe","neymar",
-    "haaland","vinicius","bellingham","salah","modric",
-    "pedri","yamal","osimhen","lewandowski","kane",
-    "saka","rashford","pulisic","ferran","gavi",
-    "wc","wcup","goal","striker","keeper",
-    "offside","redcard","yellowcard","shootout",
-])
+# General scan keywords — broad coverage across trending/new tokens, no WC bias
+SCAN_KEYWORDS = [
+    "solana","bsc","base","new","launch","pump","meme","trending",
+    "pepe","doge","cat","inu","ai","moon","gem","2026","coin",
+    "elon","trump","frog","wojak","chad","based","degen","viral",
+]
+
+# Free RSS feeds — no API key needed
+NEWS_RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+]
+
+# Names/terms that should trigger an instant ping — editable via /addnewskeyword
+news_keywords: set = {
+    "ansem", "memecoin", "pump.fun", "surge", "viral", "airdrop",
+    "elon musk", "trump", "binance listing", "coinbase listing",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -86,13 +79,9 @@ start_time = time.time()
 total_alerts = 0
 total_gems = 0
 total_scans = 0
-ws_events_received = 0
-ws_creates_received = 0
-ws_trades_received = 0
-ws_connected_since = 0
-last_event_time = 0
 alert_times = deque()
 last_tg_send = 0
+# Tracks tokens discovered via DEXScreener polling for /findbetter lookups
 token_activity: dict = defaultdict(lambda: {
     "buys": 0, "sells": 0, "wallets": set(),
     "volume_sol": 0.0, "first_seen": time.time(),
@@ -122,6 +111,9 @@ pending_buys: dict = {}
 # ── Whale wallets to track ────────────────────────────────────────────────────
 whale_wallets: set = set()
 
+# ── News scanner state ────────────────────────────────────────────────────────
+seen_news_links: set = set()  # avoid re-alerting the same headline
+
 # ── Rate Limiting ─────────────────────────────────────────────────────────────
 def can_alert():
     now = time.time()
@@ -133,13 +125,6 @@ def record_alert():
     alert_times.append(time.time())
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def is_wc_token(name="", symbol=""):
-    name = name.lower(); symbol = symbol.lower()
-    for kw in WC_KEYWORDS:
-        if kw in name or kw in symbol:
-            return True
-    return False
-
 def is_stable(symbol):
     return symbol.upper() in {"USDT","USDC","BUSD","DAI","WETH","WBNB","WSOL","ETH","BNB","SOL","WBTC"}
 
@@ -172,11 +157,9 @@ def make_alert_card(data: dict) -> bytes:
     _rounded_rect(draw, [10,10,W-10,H-10], 12, CARD, BORDER, 1)
     _rounded_rect(draw, [10,10,W-10,58],   12, "#1a2332")
     draw.rectangle([10,46,W-10,58], fill="#1a2332")
-    is_wc  = data.get("is_wc", False)
     is_gem = data.get("is_gem", False)
-    if is_wc:   hdr_color, hdr_text = SOCCER, "⚽ WC MEMECOIN ALERT"
-    elif is_gem: hdr_color, hdr_text = PURPLE, "💎 EARLY GEM ALERT"
-    else:        hdr_color, hdr_text = GREEN,  "🚀 TOKEN ALERT"
+    if is_gem: hdr_color, hdr_text = PURPLE, "💎 EARLY GEM ALERT"
+    else:      hdr_color, hdr_text = GREEN,  "🚀 TOKEN ALERT"
     draw.text((24, 18), hdr_text, font=f_big, fill=hdr_color)
     chain = data.get("chain","SOL").upper()
     chain_colors = {"SOLANA":"#9945ff","BSC":"#f0b90b","BASE":"#0052ff","ETHEREUM":"#627eea"}
@@ -319,7 +302,7 @@ def make_pnl_card(trade: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-def build_card_data(pair, trigger, verdict, score, wc, gem):
+def build_card_data(pair, trigger, verdict, score, gem):
     base    = pair.get("baseToken") or {}
     created = pair.get("pairCreatedAt") or 0
     age_min = int(((time.time() * 1000) - created) / 60_000) if created else 0
@@ -340,7 +323,6 @@ def build_card_data(pair, trigger, verdict, score, wc, gem):
         "score":   score,
         "verdict": verdict,
         "age":     age_str,
-        "is_wc":   wc,
         "is_gem":  gem,
         "trigger": trigger,
         "time":    datetime.now(timezone.utc).strftime("%H:%M UTC"),
@@ -698,7 +680,7 @@ def rug_score(pair, gem_mode=False, activity=None):
     return verdict, greens + flags, score
 
 # ── Format Alert ──────────────────────────────────────────────────────────────
-def format_alert(pair, trigger, verdict, flags, score, is_wc=False, is_gem=False, activity=None):
+def format_alert(pair, trigger, verdict, flags, score, is_gem=False, activity=None):
     base    = pair.get("baseToken") or {}
     name    = base.get("name","Unknown"); symbol = base.get("symbol","?")
     address = base.get("address","");    chain  = pair.get("chainId","solana").upper()
@@ -720,9 +702,8 @@ def format_alert(pair, trigger, verdict, flags, score, is_wc=False, is_gem=False
     flags_text = "\n".join(flags) if flags else "None"
     mc_line = f"📊 MC: ${mc:,.0f}\n" if mc > 0 else ""
     alerts_left = settings["max_alerts_hr"] - len(alert_times)
-    if is_wc:   header = "⚽ <b>WC MEMECOIN ALERT</b> ⚽"
-    elif is_gem: header = "💎 <b>EARLY GEM ALERT</b> 💎"
-    else:        header = "🚀 <b>TOKEN ALERT</b> 🚀"
+    if is_gem: header = "💎 <b>EARLY GEM ALERT</b> 💎"
+    else:      header = "🚀 <b>TOKEN ALERT</b> 🚀"
     activity_line = ""
     if activity:
         wallets = len(activity.get("wallets",set()))
@@ -768,11 +749,6 @@ HELP_TEXT = """🤖 <b>Alpha Bot v7 Commands</b>
 <b>🔗 Chain</b>
 /chain solana|bsc|base|eth|all
 
-<b>⚽ WC Scanner</b>
-/wc on|off
-/trending — hottest WC pumps
-/top — top 5 WC tokens
-
 <b>💎 Gem Hunter</b>
 /gem on|off
 /mcap [min] [max]
@@ -815,10 +791,15 @@ HELP_TEXT = """🤖 <b>Alpha Bot v7 Commands</b>
 /removewhale [wallet]
 /whales — view tracked wallets
 
+<b>📰 Narrative/News Alerts</b>
+/addnewskeyword [word] — get pinged when this trends in crypto news
+/removenewskeyword [word]
+/newskeywords — view your watchlist
+
 <b>📋 Recap</b>
 /recap — last 24h summary
 /pnl — all-time PnL summary
-/debug — raw WebSocket diagnostics
+/debug — scanner diagnostics
 
 <b>📌 Watchlist</b>
 /watch [CA]
@@ -876,7 +857,6 @@ def handle_command(chat_id, text, user_id=None):
 ━━━━━━━━━━━━━━━━━━━━
 {'⏸ PAUSED' if settings['paused'] else '▶️ RUNNING'}
 🔗 Chains: {', '.join(settings['chains']).upper()}
-⚽ WC Mode: {'On' if settings['wc_mode'] else 'Off'}
 💎 Gem Mode: {'On' if settings['gem_mode'] else 'Off'}
 💰 Trade size: ${settings['max_trade_usd']}
 🎯 Take profit: {settings['take_profit_pct']}%
@@ -917,9 +897,6 @@ def handle_command(chat_id, text, user_id=None):
         chain_map={"solana":["solana"],"bsc":["bsc"],"base":["base"],"eth":["ethereum"],"all":ALL_CHAINS[:]}
         if val not in chain_map: send_tg(chat_id,"Options: solana, bsc, base, eth, all"); return
         settings["chains"]=chain_map[val]; send_tg(chat_id,f"✅ Scanning: {', '.join(settings['chains']).upper()}")
-    elif cmd=="/wc":
-        if len(parts)<2 or parts[1].lower() not in ["on","off"]: send_tg(chat_id,"Usage: /wc on|off"); return
-        settings["wc_mode"]=parts[1].lower()=="on"; send_tg(chat_id,f"✅ WC Scanner: {'On' if settings['wc_mode'] else 'Off'}")
     elif cmd=="/gem":
         if len(parts)<2 or parts[1].lower() not in ["on","off"]: send_tg(chat_id,"Usage: /gem on|off"); return
         settings["gem_mode"]=parts[1].lower()=="on"; send_tg(chat_id,f"✅ Gem Mode: {'On' if settings['gem_mode'] else 'Off'}")
@@ -928,31 +905,30 @@ def handle_command(chat_id, text, user_id=None):
         settings["gem_mc_min"]=int(parts[1]); settings["gem_mc_max"]=int(parts[2])
         send_tg(chat_id,f"✅ MC range: ${settings['gem_mc_min']:,} - ${settings['gem_mc_max']:,}")
     elif cmd=="/reset":
-        settings.update({"max_alerts_hr":13,"min_rug_score":35,"min_buys_5min":5,
-            "min_bonding_pct":3.0,"min_vol_usd":500,"buy_ratio_min":0.55,
-            "min_liq":1000,"chains":ALL_CHAINS[:],"wc_mode":True,"gem_mode":True,
+        settings.update({"max_alerts_hr":6,"min_rug_score":45,"min_buys_5min":5,
+            "min_bonding_pct":3.0,"min_vol_usd":2000,"buy_ratio_min":0.60,
+            "min_liq":5000,"chains":ALL_CHAINS[:],"gem_mode":True,
             "gem_mc_min":2000,"gem_mc_max":50000,"paused":False,"charts":True,
-            "safe_only":False,"threshold":20,"min_rug_score_wc":25,
+            "safe_only":False,"threshold":30,
             "auto_buy":False,"max_trade_usd":5.0,"take_profit_pct":100.0,
             "trailing_stop":25.0,"dead_vol_mins":30,"min_score_buy":50})
-        send_tg(chat_id,"✅ All settings reset!")
+        send_tg(chat_id,"✅ All settings reset to anti-spam defaults!")
     elif cmd=="/check":
         if len(parts)<2: send_tg(chat_id,"Usage: /check [CA]"); return
         send_tg(chat_id,"🔍 Checking token...")
         pair=dex_get(parts[1])
         if not pair: send_tg(chat_id,"❌ Token not found."); return
         base=pair.get("baseToken") or {}
-        wc=is_wc_token(base.get("name",""),base.get("symbol",""))
         mc=pair.get("marketCap") or pair.get("fdv") or 0
         gem=settings["gem_mc_min"]<=mc<=settings["gem_mc_max"]
         act=token_activity.get(parts[1])
         verdict,flags,score=rug_score(pair,gem_mode=gem,activity=act)
-        card_d=build_card_data(pair,"📋 Manual Check",verdict,score,wc,gem)
+        card_d=build_card_data(pair,"📋 Manual Check",verdict,score,gem)
         card_b=make_alert_card(card_d)
         markup=buy_markup(parts[1]) if score>=settings["min_score_buy"] and parts[1] not in positions else None
-        send_tg(chat_id,format_alert(pair,"📋 Manual Check",verdict,flags,score,is_wc=wc,is_gem=gem,activity=act),
+        send_tg(chat_id,format_alert(pair,"📋 Manual Check",verdict,flags,score,is_gem=gem,activity=act),
                 photo_bytes=card_b,reply_markup=markup)
-        pending_buys[parts[1]]={"pair":pair,"score":score,"verdict":verdict,"flags":flags,"wc":wc,"gem":gem}
+        pending_buys[parts[1]]={"pair":pair,"score":score,"verdict":verdict,"flags":flags,"gem":gem}
     elif cmd=="/watch":
         if len(parts)<2: send_tg(chat_id,"Usage: /watch [CA]"); return
         watchlist.add(parts[1].lower()); send_tg(chat_id,f"📌 Added! Watchlist: {len(watchlist)} tokens.")
@@ -963,17 +939,17 @@ def handle_command(chat_id, text, user_id=None):
         if not watchlist: send_tg(chat_id,"📌 Empty."); return
         send_tg(chat_id,"📌 <b>Watchlist</b>\n"+"".join([f"• <code>{ca}</code>\n" for ca in watchlist]))
     elif cmd=="/top":
-        send_tg(chat_id,"🔍 Fetching top WC tokens...")
+        send_tg(chat_id,"🔍 Fetching top tokens...")
         results=[]
-        for kw in ["worldcup","wc2026","fifa","mbappe","messi"]:
+        for kw in SCAN_KEYWORDS:
             for pair in dex_search(kw):
                 if pair.get("chainId") in settings["chains"]:
                     vol=(pair.get("volume") or {}).get("h24",0) or 0
                     liq=(pair.get("liquidity") or {}).get("usd",0) or 0
                     if liq>1000: results.append((vol,pair))
         results.sort(key=lambda x:x[0],reverse=True)
-        if not results: send_tg(chat_id,"No WC tokens found."); return
-        msg="🏆 <b>Top 5 WC Tokens</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        if not results: send_tg(chat_id,"No tokens found."); return
+        msg="🏆 <b>Top 5 Tokens (24h Vol)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         for i,(vol,pair) in enumerate(results[:5],1):
             base=pair.get("baseToken") or {}
             ch24=(pair.get("priceChange") or {}).get("h24",0) or 0
@@ -983,7 +959,7 @@ def handle_command(chat_id, text, user_id=None):
     elif cmd=="/trending":
         send_tg(chat_id,"🔍 Finding hottest pumps...")
         results=[]
-        for kw in list(WC_KEYWORDS)[:15]:
+        for kw in SCAN_KEYWORDS:
             for pair in dex_search(kw):
                 if pair.get("chainId") in settings["chains"]:
                     ch1=(pair.get("priceChange") or {}).get("h1",0) or 0
@@ -995,8 +971,7 @@ def handle_command(chat_id, text, user_id=None):
         for i,(ch1,pair) in enumerate(results[:5],1):
             base=pair.get("baseToken") or {}
             liq=(pair.get("liquidity") or {}).get("usd",0) or 0
-            wc="⚽" if is_wc_token(base.get("name",""),base.get("symbol","")) else ""
-            msg+=f"{i}. {wc}<b>{base.get('name','?')} (${base.get('symbol','?')})</b> +{ch1:.1f}%\n   Liq: ${liq:,.0f} | <a href=\"{pair.get('url','')}\">Chart</a>\n\n"
+            msg+=f"{i}. <b>{base.get('name','?')} (${base.get('symbol','?')})</b> +{ch1:.1f}%\n   Liq: ${liq:,.0f} | <a href=\"{pair.get('url','')}\">Chart</a>\n\n"
         send_tg(chat_id,msg)
     elif cmd=="/findbetter":
         send_tg(chat_id,"💎 Hunting gems...")
@@ -1004,22 +979,21 @@ def handle_command(chat_id, text, user_id=None):
         for mint,act in list(token_activity.items()):
             if found>=5: break
             if now-act.get("first_seen",now)>1800: continue
-            if act.get("buys",0)<5 or act.get("bonding_pct",0)<3: continue
+            if act.get("buys",0)<3: continue
             pair=dex_get(mint)
             if not pair: continue
             liq=(pair.get("liquidity") or {}).get("usd",0) or 0
             if liq<500: continue
-            wc=is_wc_token(act.get("name",""),act.get("symbol",""))
             mc=pair.get("marketCap") or pair.get("fdv") or 0
             gem=settings["gem_mc_min"]<=mc<=settings["gem_mc_max"]
             verdict,flags,score=rug_score(pair,gem_mode=gem,activity=act)
             if score>=35 and "RUG" not in verdict:
-                card_d=build_card_data(pair,"💎 Manual Hunt",verdict,score,wc,gem)
+                card_d=build_card_data(pair,"💎 Manual Hunt",verdict,score,gem)
                 card_b=make_alert_card(card_d)
                 markup=buy_markup(mint) if score>=settings["min_score_buy"] else None
-                send_tg(chat_id,format_alert(pair,"💎 Manual Hunt",verdict,flags,score,is_wc=wc,is_gem=gem,activity=act),
+                send_tg(chat_id,format_alert(pair,"💎 Manual Hunt",verdict,flags,score,is_gem=gem,activity=act),
                         photo_bytes=card_b,reply_markup=markup)
-                pending_buys[mint]={"pair":pair,"score":score,"wc":wc,"gem":gem}
+                pending_buys[mint]={"pair":pair,"score":score,"gem":gem}
                 found+=1; time.sleep(3)
         if found==0: send_tg(chat_id,"No fresh gems. Try again soon!")
     elif cmd=="/alert":
@@ -1054,9 +1028,9 @@ def handle_command(chat_id, text, user_id=None):
     elif cmd=="/recap":
         now=time.time(); recent=[r for r in recap_log if now-r["time"]<=86400]
         if not recent: send_tg(chat_id,"📋 No alerts in last 24h."); return
-        wc_c=sum(1 for r in recent if r.get("is_wc")); gem_c=sum(1 for r in recent if r.get("is_gem"))
+        gem_c=sum(1 for r in recent if r.get("is_gem"))
         avg=sum(r["score"] for r in recent)/len(recent)
-        msg=f"📋 <b>Last 24h Recap</b>\n━━━━━━━━━━━━━━━━━━━━\n📢 Alerts: {len(recent)} | ⚽ WC: {wc_c} | 💎 Gems: {gem_c}\n🛡 Avg score: {avg:.0f}/100\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg=f"📋 <b>Last 24h Recap</b>\n━━━━━━━━━━━━━━━━━━━━\n📢 Alerts: {len(recent)} | 💎 Gems: {gem_c}\n🛡 Avg score: {avg:.0f}/100\n━━━━━━━━━━━━━━━━━━━━\n"
         for r in recent[-10:]:
             t=datetime.fromtimestamp(r["time"],tz=timezone.utc).strftime("%H:%M")
             msg+=f"[{t}] <b>{r['name']} (${r['symbol']})</b> — {r['verdict']} {r['score']}/100\n"
@@ -1198,7 +1172,22 @@ def handle_command(chat_id, text, user_id=None):
 
     elif cmd=="/whales":
         if not whale_wallets: send_tg(chat_id,"🐋 No whale wallets tracked. Use /addwhale [wallet]"); return
-        send_tg(chat_id,"🐋 <b>Tracked Whales</b>\n"+"".join([f"• <code>{w}</code>\n" for w in whale_wallets]))
+        send_tg(chat_id,"🐋 <b>Tracked Whales</b>\n"+"".join([f"• <code>{w}</code>\n" for w in whale_wallets])+"\n⚠️ Live whale-buy alerts need a funded wallet (real-time trade feed). For now this is just a saved list.")
+
+    elif cmd=="/addnewskeyword":
+        if len(parts)<2: send_tg(chat_id,"Usage: /addnewskeyword [word or name]\nExample: /addnewskeyword vitalik"); return
+        kw=" ".join(parts[1:]).lower()
+        news_keywords.add(kw)
+        send_tg(chat_id,f"📰 Added '{kw}' to news watchlist! ({len(news_keywords)} total)")
+
+    elif cmd=="/removenewskeyword":
+        if len(parts)<2: send_tg(chat_id,"Usage: /removenewskeyword [word]"); return
+        kw=" ".join(parts[1:]).lower()
+        news_keywords.discard(kw)
+        send_tg(chat_id,f"✅ Removed '{kw}' from news watchlist.")
+
+    elif cmd=="/newskeywords":
+        send_tg(chat_id,"📰 <b>News Watchlist</b>\n"+"".join([f"• {k}\n" for k in sorted(news_keywords)])+"\nAdd more with /addnewskeyword [word]")
 
     elif cmd=="/addadmin":
         if len(parts)<2: send_tg(chat_id,"Usage: /addadmin [telegram_user_id]\nForward a message from them or ask for their ID via @userinfobot"); return
@@ -1220,24 +1209,20 @@ def handle_command(chat_id, text, user_id=None):
         send_tg(chat_id,f"🆔 Your Telegram user ID: <code>{user_id or chat_id}</code>\nGive this to a bot admin to get admin access.")
 
     elif cmd=="/debug":
-        now=time.time()
-        connected_secs=int(now-ws_connected_since) if ws_connected_since else 0
-        since_last=int(now-last_event_time) if last_event_time else -1
         active_tokens=len(token_activity)
         tokens_with_buys=sum(1 for a in token_activity.values() if a.get("buys",0)>0)
+        uptime_secs=int(time.time()-start_time)
         send_tg(chat_id,f"""🔧 <b>Debug Diagnostics</b>
 ━━━━━━━━━━━━━━━━━━━━
-🔑 API key: {'✅ Loaded' if PUMPPORTAL_API_KEY else '❌ Missing'}
-🔌 WS connected for: {connected_secs}s
-📨 Total events: {ws_events_received}
-🆕 'create' events: {ws_creates_received}
-💱 'buy'/'sell' events: {ws_trades_received}
-⏱ Last event: {since_last}s ago
+🔌 Scanner: DEXScreener (free, no wallet needed)
+🟢 Bot uptime: {uptime_secs}s
+🔍 Scan cycles completed: {total_scans}
 📦 Tokens tracked: {active_tokens}
-📈 Tokens w/ buys: {tokens_with_buys}
-🔍 Last scan: {total_scans}
+📈 Tokens w/ buy data: {tokens_with_buys}
+📢 Alerts sent (lifetime): {total_alerts}
+📢 Alerts this hour: {len(alert_times)}/{settings['max_alerts_hr']}
 ━━━━━━━━━━━━━━━━━━━━
-{'⚠️ No events in 60s+ — WS may be silently stalled' if since_last>60 else '✅ Receiving data normally'}""")
+{'✅ Running normally — scans every 30s' if total_scans>0 else '⏳ First scan not completed yet, wait ~30s'}""")
 
     else:
         send_tg(chat_id,"❓ Unknown command. Send /help")
@@ -1372,138 +1357,70 @@ async def price_alert_loop():
                 log.error(f"Price alert error: {e}")
         for mint in to_remove: price_alerts.pop(mint,None)
 
-# ── DEXScreener Fallback Scanner (runs if WebSocket dies) ────────────────────
-async def dexscreener_fallback():
-    """Scan DEXScreener every 30s as a fallback when WebSocket is down."""
-    log.info("DEXScreener fallback scanner started")
+# ── DEXScreener Scanner (PRIMARY & ONLY detection engine — 100% free, no wallet/API key needed) ──
+async def dexscreener_scanner():
+    """Continuously scans DEXScreener for new/pumping tokens across all chains. No wallet or API key required."""
+    global total_scans
+    log.info("DEXScreener scanner started (free, no wallet needed)")
     while True:
         await asyncio.sleep(30)
-        if settings["paused"]: continue
+        if settings["paused"]:
+            continue
         try:
+            total_scans += 1
             checked = set()
-            keywords = list(WC_KEYWORDS)[:20] + ["solana","bsc","meme","pepe","doge","new","launch"]
-            for kw in keywords:
+            for kw in SCAN_KEYWORDS:
                 pairs = dex_search(kw)
                 for pair in pairs:
-                    chain = pair.get("chainId","")
-                    if chain not in settings["chains"]: continue
-                    base  = pair.get("baseToken") or {}
-                    mint  = base.get("address","")
-                    if not mint or mint in checked or mint in seen or mint in rug_blacklist: continue
+                    chain = pair.get("chainId", "")
+                    if chain not in settings["chains"]:
+                        continue
+                    base = pair.get("baseToken") or {}
+                    mint = base.get("address", "")
+                    if not mint or mint in checked or mint in seen or mint in rug_blacklist:
+                        continue
                     checked.add(mint)
-                    sym = base.get("symbol","").upper()
-                    if is_stable(sym): continue
-                    liq    = (pair.get("liquidity") or {}).get("usd",0) or 0
-                    vol_h1 = (pair.get("volume") or {}).get("h1",0) or 0
-                    ch_h1  = (pair.get("priceChange") or {}).get("h1",0) or 0
-                    created= pair.get("pairCreatedAt") or 0
-                    age_min= ((time.time()*1000)-created)/60_000 if created else 9999
-                    if liq < settings["min_liq"]: continue
-                    # Only alert on new tokens (under 30 min) or big moves
-                    if age_min > 30 and abs(ch_h1) < settings["threshold"]: continue
-                    if not can_alert(): break
-                    fake_activity = {
-                        "buys":int(vol_h1/50) if vol_h1 else 5,
-                        "sells":2,"wallets":set(),"volume_sol":vol_h1/150,
-                        "first_seen":time.time()-(age_min*60),
-                        "dev_sold":False,"bonding_pct":10.0,
-                        "name":base.get("name",""),"symbol":sym,"mint":mint,
+                    sym = base.get("symbol", "").upper()
+                    if is_stable(sym):
+                        continue
+                    liq     = (pair.get("liquidity") or {}).get("usd", 0) or 0
+                    vol_h1  = (pair.get("volume") or {}).get("h1", 0) or 0
+                    ch_h1   = (pair.get("priceChange") or {}).get("h1", 0) or 0
+                    created = pair.get("pairCreatedAt") or 0
+                    age_min = ((time.time() * 1000) - created) / 60_000 if created else 9999
+
+                    if liq < settings["min_liq"]:
+                        continue
+                    # Alert on fresh tokens (under 30 min) OR tokens making a big move
+                    if age_min > 30 and abs(ch_h1) < settings["threshold"]:
+                        continue
+                    if vol_h1 < settings["min_vol_usd"]:
+                        continue
+                    if not can_alert():
+                        break
+
+                    # Build activity dict from real DEXScreener data (no fake/estimated buys)
+                    txns_h1 = ((pair.get("txns") or {}).get("h1") or {})
+                    activity = {
+                        "buys": txns_h1.get("buys", 0) or 0,
+                        "sells": txns_h1.get("sells", 0) or 0,
+                        "wallets": set(),
+                        "volume_sol": vol_h1 / 150,  # rough SOL estimate just for display
+                        "first_seen": time.time() - (age_min * 60),
+                        "dev_sold": False,
+                        "bonding_pct": 0.0,
+                        "name": base.get("name", ""),
+                        "symbol": sym,
+                        "mint": mint,
                     }
+                    # Track it so /findbetter and /debug have real data to show
+                    token_activity[mint].update(activity)
+
                     loop = asyncio.get_event_loop()
-                    loop.run_in_executor(None, process_token, mint, fake_activity)
-                    await asyncio.sleep(0.5)
+                    loop.run_in_executor(None, process_token, mint, activity)
+                    await asyncio.sleep(0.4)  # be polite to DEXScreener's API
         except Exception as e:
-            log.error(f"DEXScreener fallback error: {e}")
-
-# ── Pump.fun WebSocket ────────────────────────────────────────────────────────
-WS_URL = f"wss://pumpportal.fun/api/data?api-key={PUMPPORTAL_API_KEY}" if PUMPPORTAL_API_KEY else "wss://pumpportal.fun/api/data"
-
-async def pumpfun_ws():
-    global ws_events_received, ws_creates_received, ws_trades_received, ws_connected_since, last_event_time
-    log.info("Connecting to Pump.fun WebSocket...")
-    retry_count = 0
-    subscribed_mints = []  # FIX: accumulate all mints, don't replace on each new token
-    while True:
-        log.info(f"Trying WebSocket: {WS_URL} (attempt {retry_count+1})")
-        try:
-            async with websockets.connect(WS_URL,ping_interval=20,ping_timeout=10) as ws:
-                log.info(f"Connected to {WS_URL}!")
-                ws_connected_since = time.time()
-                if retry_count > 0:
-                    broadcast(f"🔌 WebSocket reconnected after {retry_count} retries")
-                retry_count = 0
-                subscribed_mints = []  # reset on reconnect, will re-subscribe as creates come in
-                await ws.send(json.dumps({"method":"subscribeNewToken"}))
-                async for raw in ws:
-                    try:
-                        ws_events_received += 1
-                        last_event_time = time.time()
-                        event=json.loads(raw)
-                        tx_type=event.get("txType",""); mint=event.get("mint","")
-                        if not mint: continue
-                        if tx_type=="create":
-                            ws_creates_received += 1
-                            name=event.get("name",""); symbol=event.get("symbol","")
-                            if is_stable(symbol): continue
-                            token_activity[mint]["name"]=name
-                            token_activity[mint]["symbol"]=symbol
-                            token_activity[mint]["mint"]=mint
-                            token_activity[mint]["first_seen"]=time.time()
-                            token_activity[mint]["bonding_pct"]=float(event.get("vSolInBondingCurve",0) or 0)/85*100
-                            # FIX: accumulate mints, send full list so old subscriptions aren't dropped
-                            subscribed_mints.append(mint)
-                            if len(subscribed_mints) > 200:  # cap to avoid unbounded growth
-                                subscribed_mints = subscribed_mints[-200:]
-                            await ws.send(json.dumps({"method":"subscribeTokenTrade","keys":subscribed_mints}))
-                        elif tx_type in ["buy","sell"]:
-                            ws_trades_received += 1
-                            act=token_activity[mint]
-                            trader=event.get("traderPublicKey","")
-                            creator=event.get("creatorPublicKey","")
-                            sol_amt=float(event.get("solAmount",0) or 0)/1e9
-                            if tx_type=="buy":
-                                act["buys"]+=1; act["volume_sol"]+=sol_amt
-                                if trader: act["wallets"].add(trader)
-                                # Whale detection
-                                if trader in whale_wallets:
-                                    pair=dex_get(mint)
-                                    name=act.get("name",mint[:8])
-                                    broadcast(f"🐋 <b>WHALE ALERT!</b>\nTracked wallet bought <b>{name}</b>\n💰 {sol_amt:.2f} SOL\n📋 <code>{mint}</code>")
-                            else:
-                                act["sells"]+=1
-                                if trader==creator: act["dev_sold"]=True
-                            bc_sol=float(event.get("vSolInBondingCurve",0) or 0)
-                            if bc_sol>0: act["bonding_pct"]=bc_sol/85*100
-                            age_min=(time.time()-act["first_seen"])/60
-                            buys=act["buys"]; unique_w=len(act["wallets"])
-                            vol_sol=act["volume_sol"]; bc_pct=act["bonding_pct"]
-                            total_txns=buys+act["sells"]
-                            buy_ratio=buys/total_txns if total_txns>0 else 0
-                            vol_usd_est=vol_sol*150
-                            wc_token=is_wc_token(act["name"],act["symbol"])
-                            # ── EQUAL FILTERS: same bar for WC and non-WC tokens
-                            passes=(
-                                unique_w>=settings["min_buys_5min"] and
-                                bc_pct>=settings["min_bonding_pct"] and
-                                not act["dev_sold"] and
-                                buy_ratio>=settings["buy_ratio_min"] and
-                                vol_usd_est>=settings["min_vol_usd"] and
-                                age_min<=15 and
-                                mint not in seen and
-                                mint not in rug_blacklist
-                            )
-                            if passes and can_alert() and not settings["paused"]:
-                                loop=asyncio.get_event_loop()
-                                loop.run_in_executor(None,process_token,mint,dict(act))
-                    except json.JSONDecodeError: continue
-                    except Exception as e: log.error(f"Event error: {e}")
-        except Exception as e:
-            retry_count += 1
-            wait = min(5 * retry_count, 30)  # backoff up to 30s max
-            log.error(f"WS error: {e} — retry #{retry_count} in {wait}s...")
-            if retry_count in (3, 10, 20):  # alert you if it's struggling
-                broadcast(f"⚠️ WebSocket reconnecting (attempt {retry_count})... DEXScreener fallback is still scanning.")
-            await asyncio.sleep(wait)
+            log.error(f"DEXScreener scanner error: {e}")
 
 # ── Process Token ─────────────────────────────────────────────────────────────
 def process_token(mint,activity):
@@ -1517,23 +1434,20 @@ def process_token(mint,activity):
     base=pair.get("baseToken") or {}
     name=base.get("name",activity.get("name",""))
     symbol=base.get("symbol",activity.get("symbol",""))
-    wc=is_wc_token(name,symbol)
     mc=pair.get("marketCap") or pair.get("fdv") or 0
     gem=settings["gem_mc_min"]<=mc<=settings["gem_mc_max"]
     verdict,flags,score=rug_score(pair,gem_mode=gem,activity=activity)
-    min_score=settings["min_rug_score"]  # EQUAL: same threshold for WC and non-WC
-    if score<min_score: return
+    if score<settings["min_rug_score"]: return
     if settings["safe_only"] and "RUG" in verdict: return
-    if wc:   trigger="⚽ NEW WC TOKEN — Pump.fun Launch"
-    elif gem: trigger=f"💎 EARLY GEM — MC ${mc:,.0f}"
-    else:     trigger="🆕 NEW TOKEN — Passed filters"
-    card_d=build_card_data(pair,trigger,verdict,score,wc,gem)
+    if gem: trigger=f"💎 EARLY GEM — MC ${mc:,.0f}"
+    else:   trigger="🆕 NEW TOKEN — Passed filters"
+    card_d=build_card_data(pair,trigger,verdict,score,gem)
     card_b=make_alert_card(card_d)
     # Show BUY button if score is high enough
     markup=None
     if score>=settings["min_score_buy"] and mint not in positions:
         markup=buy_markup(mint)
-        pending_buys[mint]={"pair":pair,"score":score,"wc":wc,"gem":gem}
+        pending_buys[mint]={"pair":pair,"score":score,"gem":gem}
     # Auto-buy if enabled
     if settings["auto_buy"] and score>=settings["min_score_buy"] and mint not in positions:
         chain=pair.get("chainId","solana")
@@ -1544,17 +1458,17 @@ def process_token(mint,activity):
             open_position(pair,settings["max_trade_usd"],result.get("tokens",0))
             markup=None  # no need for button if already bought
     broadcast(
-        format_alert(pair,trigger,verdict,flags,score,is_wc=wc,is_gem=gem,activity=activity),
+        format_alert(pair,trigger,verdict,flags,score,is_gem=gem,activity=activity),
         photo_bytes=card_b, reply_markup=markup,
     )
     record_alert(); total_alerts+=1
     if gem: total_gems+=1
     seen[mint]={"alerted_at":time.time()}
     recap_log.append({"time":time.time(),"name":name,"symbol":symbol,"trigger":trigger,
-                       "score":score,"verdict":verdict,"is_wc":wc,"is_gem":gem,"url":pair.get("url","")})
+                       "score":score,"verdict":verdict,"is_gem":gem,"url":pair.get("url","")})
     cutoff=time.time()-86400
     while recap_log and recap_log[0]["time"]<cutoff: recap_log.pop(0)
-    log.info(f"Alerted: {name} ({symbol}) score={score} wc={wc} gem={gem}")
+    log.info(f"Alerted: {name} ({symbol}) score={score} gem={gem}")
 
 # ── Loops ─────────────────────────────────────────────────────────────────────
 async def command_loop():
@@ -1571,6 +1485,58 @@ async def cleanup_loop():
         seen_del=[m for m,v in seen.items() if now-v.get("alerted_at",now)>86400]
         for m in to_del: del token_activity[m]
         for m in seen_del: del seen[m]
+        # Trim seen_news_links so it doesn't grow forever
+        if len(seen_news_links) > 1000:
+            seen_news_links.clear()
+
+def fetch_rss(url: str) -> list[dict]:
+    """Fetch and parse an RSS feed, return list of {title, link}."""
+    items = []
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item")[:30]:
+            title = (item.findtext("title") or "").strip()
+            link  = (item.findtext("link") or "").strip()
+            if title and link:
+                items.append({"title": title, "link": link})
+    except Exception as e:
+        log.error(f"RSS fetch error [{url}]: {e}")
+    return items
+
+async def news_scanner():
+    """Polls free crypto RSS feeds every 3 min, pings instantly on keyword match."""
+    log.info("News/narrative scanner started")
+    while True:
+        await asyncio.sleep(180)  # every 3 minutes
+        if settings["paused"]:
+            continue
+        try:
+            for feed_url in NEWS_RSS_FEEDS:
+                items = fetch_rss(feed_url)
+                for item in items:
+                    link = item["link"]
+                    if link in seen_news_links:
+                        continue
+                    title_lower = item["title"].lower()
+                    matched = [kw for kw in news_keywords if kw.lower() in title_lower]
+                    if not matched:
+                        continue
+                    seen_news_links.add(link)
+                    broadcast(
+                        f"📰 <b>NARRATIVE ALERT</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔥 Matched: {', '.join(matched)}\n\n"
+                        f"<b>{item['title']}</b>\n\n"
+                        f"🔍 <a href=\"{link}\">Read more</a>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ Always verify the contract address yourself — famous names "
+                        f"attract copycat tokens within minutes."
+                    )
+                    await asyncio.sleep(1)
+        except Exception as e:
+            log.error(f"News scanner error: {e}")
 
 async def daily_pnl_summary():
     """Send daily PnL summary at midnight UTC."""
@@ -1595,25 +1561,23 @@ All-time PnL: {'+' if sum(t['pnl_usd'] for t in trade_history)>=0 else ''}${sum(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("Alpha Bot v7 starting...")
-    key_status = "✅ PumpPortal API key loaded — trade data enabled" if PUMPPORTAL_API_KEY else "⚠️ No PumpPortal API key — trade events may not work!"
-    log.info(key_status)
+    log.info("Alpha Bot v8 starting...")
     broadcast(
-        "🤖 <b>Alpha Bot v7 is LIVE!</b>\n"
-        "🔌 Pump.fun WebSocket connected\n"
-        f"{key_status}\n"
-        "⚡ Real-time token detection\n"
-        "⚽ WC tokens + 💎 Gems + 🛡 Rug Score\n"
+        "🤖 <b>Alpha Bot v8 is LIVE!</b>\n"
+        "🔌 DEXScreener scanner — 100% free, no wallet or API key needed\n"
+        "⚡ Scans every 30s across all chains\n"
+        "💎 Gems + 🛡 Rug Score\n"
         "🖼 Image cards ON\n"
-        "💰 Trading: SOL (Jupiter) + BSC (PancakeSwap)\n"
+        "💰 Trading: SOL (Jupiter) + BSC (PancakeSwap) — fund a wallet when ready\n"
         "📊 PnL cards on every trade close\n"
         "🐋 Whale wallet tracker\n"
-        "🔧 FIXED: All token types now showing\n\n"
+        "📰 Narrative/news alerts — every 3 min, free RSS feeds\n"
+        "🔧 No WC bias — equal scanning across all tokens\n\n"
         "/help to see all commands 👇"
     )
     await asyncio.gather(
-        pumpfun_ws(),
-        dexscreener_fallback(),
+        dexscreener_scanner(),
+        news_scanner(),
         command_loop(),
         cleanup_loop(),
         price_alert_loop(),
