@@ -1,5 +1,4 @@
 requests==2.31.0
-websockets==12.0
 Pillow==10.3.0
 solders==0.21.0
 web3==6.15.1
